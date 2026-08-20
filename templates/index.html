@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Local Coding Agent</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>🛠️ Local Coding Agent</h1>
+      <div class="model-row">
+        <label for="provider-select">Provider:</label>
+        <select id="provider-select"></select>
+        <label for="model-select">Model:</label>
+        <select id="model-select"></select>
+        <span id="status-dot" class="status-dot" title="Provider status"></span>
+      </div>
+    </header>
+
+    <section class="repo-panel">
+      <div class="repo-row">
+        <input id="repo-path" type="text" placeholder="Absolute path to a local repo, e.g. /Users/you/project" />
+        <button id="index-btn" type="button">Index Repo</button>
+        <label class="repo-toggle">
+          <input id="use-repo" type="checkbox" disabled />
+          Use repo context
+        </label>
+      </div>
+      <div id="repo-status" class="repo-status">No repo indexed yet.</div>
+    </section>
+
+    <main id="chat"></main>
+
+    <form id="chat-form">
+      <textarea id="input" placeholder="Ask a coding question, paste a snippet to complete/fix, etc. (Shift+Enter for newline)" rows="3"></textarea>
+      <button type="submit" id="send-btn">Send</button>
+    </form>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
