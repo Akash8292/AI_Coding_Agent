@@ -30,8 +30,37 @@
           <input id="use-repo" type="checkbox" disabled />
           Use repo context
         </label>
+        <button id="run-tests-btn" type="button" class="secondary" disabled>Run tests</button>
       </div>
       <div id="repo-status" class="repo-status">No repo indexed yet.</div>
+      <pre id="test-output" class="diff-view" style="display:none;"></pre>
+    </section>
+
+    <section class="edit-panel">
+      <button id="edit-toggle" type="button" class="edit-toggle">▸ Propose a code edit</button>
+      <div id="edit-body" class="edit-body" style="display:none;">
+        <input id="edit-path" type="text" placeholder="Path to the file, relative to the indexed repo, e.g. app.py or src/utils.py" />
+        <textarea id="edit-instruction" rows="2" placeholder="Describe the change, e.g. 'add a docstring to the chat() function'"></textarea>
+        <button id="propose-btn" type="button">Propose Edit</button>
+      </div>
+    </section>
+
+    <section class="edit-panel">
+      <button id="diagnose-toggle" type="button" class="edit-toggle">▸ Diagnose &amp; fix a bug</button>
+      <div id="diagnose-body" class="edit-body" style="display:none;">
+        <textarea id="diagnose-problem" rows="3" placeholder="Describe the bug or paste an error/traceback. The agent will search the indexed repo to find the likely file and propose a fix."></textarea>
+        <button id="diagnose-btn" type="button">Diagnose &amp; Fix</button>
+      </div>
+    </section>
+
+    <section class="review-panel" id="review-panel" style="display:none;">
+      <div id="edit-status" class="repo-status"></div>
+      <div id="edit-explanation" class="edit-explanation" style="display:none;"></div>
+      <pre id="diff-view" class="diff-view" style="display:none;"></pre>
+      <div id="edit-actions" class="edit-actions" style="display:none;">
+        <button id="apply-btn" type="button">Apply to file</button>
+        <button id="discard-btn" type="button" class="secondary">Discard</button>
+      </div>
     </section>
 
     <main id="chat"></main>

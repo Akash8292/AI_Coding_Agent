@@ -9,6 +9,29 @@ const repoPathInput = document.getElementById("repo-path");
 const indexBtn = document.getElementById("index-btn");
 const useRepoCheckbox = document.getElementById("use-repo");
 const repoStatusEl = document.getElementById("repo-status");
+const runTestsBtn = document.getElementById("run-tests-btn");
+const testOutputEl = document.getElementById("test-output");
+
+const editToggle = document.getElementById("edit-toggle");
+const editBody = document.getElementById("edit-body");
+const editPathInput = document.getElementById("edit-path");
+const editInstructionInput = document.getElementById("edit-instruction");
+const proposeBtn = document.getElementById("propose-btn");
+
+const diagnoseToggle = document.getElementById("diagnose-toggle");
+const diagnoseBody = document.getElementById("diagnose-body");
+const diagnoseProblemInput = document.getElementById("diagnose-problem");
+const diagnoseBtn = document.getElementById("diagnose-btn");
+
+const reviewPanel = document.getElementById("review-panel");
+const editStatusEl = document.getElementById("edit-status");
+const editExplanationEl = document.getElementById("edit-explanation");
+const diffView = document.getElementById("diff-view");
+const editActions = document.getElementById("edit-actions");
+const applyBtn = document.getElementById("apply-btn");
+const discardBtn = document.getElementById("discard-btn");
+
+let pendingEdit = null; // { path, content }
 
 let history = []; // [{role, content}]
 let pollTimer = null;
@@ -108,6 +131,7 @@ function renderRepoStatus(s) {
       `Repo context is ready to use.`;
     useRepoCheckbox.disabled = false;
     useRepoCheckbox.checked = true;
+    runTestsBtn.disabled = false;
   } else if (s.status === "error") {
     repoStatusEl.textContent = `Indexing failed: ${s.error}`;
   }
@@ -210,6 +234,194 @@ input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     form.requestSubmit();
+  }
+});
+
+// ---- Propose/apply file edits, diagnose-and-fix, run tests --------------
+
+editToggle.addEventListener("click", () => {
+  const showing = editBody.style.display !== "none";
+  editBody.style.display = showing ? "none" : "flex";
+  editToggle.textContent = (showing ? "▸" : "▾") + " Propose a code edit";
+});
+
+diagnoseToggle.addEventListener("click", () => {
+  const showing = diagnoseBody.style.display !== "none";
+  diagnoseBody.style.display = showing ? "none" : "flex";
+  diagnoseToggle.textContent = (showing ? "▸" : "▾") + " Diagnose & fix a bug";
+});
+
+function renderDiff(diffLines) {
+  const classMap = {
+    add: "diff-add",
+    remove: "diff-remove",
+    hunk: "diff-hunk",
+    header: "diff-header",
+    context: "diff-context",
+  };
+  return diffLines
+    .map((l) => {
+      const escaped = l.text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return `<span class="${classMap[l.type] || "diff-context"}">${escaped || " "}</span>`;
+    })
+    .join("\n");
+}
+
+function resetReviewUI() {
+  editExplanationEl.style.display = "none";
+  editExplanationEl.textContent = "";
+  diffView.style.display = "none";
+  diffView.innerHTML = "";
+  editActions.style.display = "none";
+  pendingEdit = null;
+}
+
+function showReviewResult(data, { notFoundMsg } = {}) {
+  reviewPanel.style.display = "flex";
+  resetReviewUI();
+
+  if (data.error) {
+    editStatusEl.textContent = `Error: ${data.error}`;
+    if (data.raw_response) {
+      diffView.style.display = "block";
+      diffView.textContent = data.raw_response;
+    }
+    return;
+  }
+
+  if (data.explanation) {
+    editExplanationEl.textContent = data.explanation;
+    editExplanationEl.style.display = "block";
+  }
+
+  if (data.unchanged) {
+    editStatusEl.textContent = `Model proposed no changes to ${data.path}.` +
+      (notFoundMsg || "");
+    return;
+  }
+
+  editStatusEl.textContent = `Review the proposed change to ${data.path}:`;
+  diffView.innerHTML = renderDiff(data.diff);
+  diffView.style.display = "block";
+  editActions.style.display = "flex";
+  pendingEdit = { path: data.path, content: data.proposed_content };
+}
+
+proposeBtn.addEventListener("click", async () => {
+  const path = editPathInput.value.trim();
+  const instruction = editInstructionInput.value.trim();
+  if (!path || !instruction) return;
+
+  proposeBtn.disabled = true;
+  reviewPanel.style.display = "flex";
+  resetReviewUI();
+  editStatusEl.textContent = "Asking the model to propose a change...";
+
+  try {
+    const res = await fetch("/api/propose_edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        instruction,
+        provider: providerSelect.value,
+        model: modelSelect.value,
+      }),
+    });
+    showReviewResult(await res.json());
+  } catch (e) {
+    editStatusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    proposeBtn.disabled = false;
+  }
+});
+
+diagnoseBtn.addEventListener("click", async () => {
+  const problem = diagnoseProblemInput.value.trim();
+  if (!problem) return;
+
+  diagnoseBtn.disabled = true;
+  reviewPanel.style.display = "flex";
+  resetReviewUI();
+  editStatusEl.textContent = "Searching the repo and diagnosing the problem...";
+
+  try {
+    const res = await fetch("/api/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        problem,
+        provider: providerSelect.value,
+        model: modelSelect.value,
+      }),
+    });
+    const data = await res.json();
+    let note = "";
+    if (data.other_candidates && data.other_candidates.length) {
+      note = ` (other files that looked related: ${data.other_candidates.join(", ")})`;
+    }
+    showReviewResult(data, { notFoundMsg: note });
+  } catch (e) {
+    editStatusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    diagnoseBtn.disabled = false;
+  }
+});
+
+applyBtn.addEventListener("click", async () => {
+  if (!pendingEdit) return;
+  applyBtn.disabled = true;
+  try {
+    const res = await fetch("/api/apply_edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(pendingEdit),
+    });
+    const data = await res.json();
+    if (data.error) {
+      editStatusEl.textContent = `Error applying edit: ${data.error}`;
+    } else {
+      editStatusEl.textContent = `Applied to ${data.path}. Original backed up to ${data.backup}.`;
+      diffView.style.display = "none";
+      diffView.innerHTML = "";
+      editActions.style.display = "none";
+      pendingEdit = null;
+    }
+  } catch (e) {
+    editStatusEl.textContent = `Error: ${e.message}`;
+  } finally {
+    applyBtn.disabled = false;
+  }
+});
+
+discardBtn.addEventListener("click", () => {
+  editStatusEl.textContent = "Discarded — nothing was written to disk.";
+  resetReviewUI();
+});
+
+runTestsBtn.addEventListener("click", async () => {
+  runTestsBtn.disabled = true;
+  testOutputEl.style.display = "block";
+  testOutputEl.textContent = "Running tests...";
+  try {
+    const res = await fetch("/api/run_tests", { method: "POST" });
+    const data = await res.json();
+    if (data.error) {
+      testOutputEl.textContent = `Error: ${data.error}`;
+    } else {
+      const verdict = data.passed ? "✅ PASSED" : "❌ FAILED";
+      testOutputEl.textContent =
+        `${verdict}  (command: ${data.command}, exit code ${data.exit_code})\n\n` +
+        (data.stdout || "") +
+        (data.stderr ? `\n--- stderr ---\n${data.stderr}` : "");
+    }
+  } catch (e) {
+    testOutputEl.textContent = `Error: ${e.message}`;
+  } finally {
+    runTestsBtn.disabled = false;
   }
 });
 

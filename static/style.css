@@ -118,6 +118,165 @@ header h1 {
   color: var(--muted);
 }
 
+.edit-panel {
+  border-bottom: 1px solid var(--border);
+  background: #12141c;
+}
+
+.edit-toggle {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 10px 20px;
+  cursor: pointer;
+}
+
+.edit-toggle:hover {
+  color: var(--text);
+}
+
+.edit-body {
+  padding: 0 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#edit-path {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+#edit-instruction {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+#propose-btn {
+  align-self: flex-start;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#propose-btn:hover {
+  border-color: var(--accent);
+}
+
+#propose-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.diff-view {
+  background: #0b0d13;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+  white-space: pre;
+  margin: 0;
+}
+
+.diff-add { color: #3ecf6e; display: block; }
+.diff-remove { color: #ff5c5c; display: block; }
+.diff-hunk { color: var(--accent); display: block; }
+.diff-header { color: var(--muted); display: block; }
+.diff-context { color: var(--text); display: block; }
+
+.edit-actions {
+  display: flex;
+  gap: 10px;
+}
+
+#apply-btn {
+  background: #3ecf6e;
+  color: #06210f;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#apply-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.review-panel {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #12141c;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.edit-explanation {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+#run-tests-btn {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#run-tests-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+#run-tests-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 main#chat {
   flex: 1;
   overflow-y: auto;
