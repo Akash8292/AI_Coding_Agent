@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  codesage:
+    build: .
+    container_name: codesage_app
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - FLASK_ENV=production
+      - DATABASE_URL=sqlite:////app/data/codesage.db
+      - JWT_SECRET=change-this-in-production-codesage-secret-key-32chars
+      - CORS_ORIGINS=*
+      - LLM_PROVIDER=openai
+      # Optional: Pass through host environment keys
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - KIMI_API_KEY=${KIMI_API_KEY:-}
+      - OLLAMA_ENABLED=${OLLAMA_ENABLED:-false}
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - codesage_data:/app/data
+      - codesage_cache:/app/index_cache
+    restart: unless-stopped
+
+volumes:
+  codesage_data:
+  codesage_cache:

@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CodeSage — AI Engineering Workspace</title>
+  <meta name="description" content="CodeSage is an AI-powered software engineering workspace that understands your repository, investigates problems, proposes code changes, and lets you stay in control." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Auth Page -->
+  <div id="auth-page" class="auth-page hidden">
+    <div class="auth-container">
+      <div class="auth-brand">
+        <div class="auth-logo">⚡</div>
+        <h1>CodeSage</h1>
+        <p>AI Engineering Workspace</p>
+      </div>
+      <div class="auth-card">
+        <div class="auth-tabs">
+          <button class="auth-tab active" id="login-tab" onclick="switchTab('login')">Sign In</button>
+          <button class="auth-tab" id="register-tab" onclick="switchTab('register')">Create Account</button>
+        </div>
+        <form id="auth-form" onsubmit="handleAuth(event)">
+          <div id="register-fields" class="hidden">
+            <div class="form-group">
+              <label for="auth-name">Name</label>
+              <input type="text" id="auth-name" placeholder="Your name" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="auth-email">Email</label>
+            <input type="email" id="auth-email" placeholder="you@example.com" required />
+          </div>
+          <div class="form-group">
+            <label for="auth-password">Password</label>
+            <input type="password" id="auth-password" placeholder="••••••••" required />
+          </div>
+          <div id="auth-error" class="auth-error hidden"></div>
+          <button type="submit" class="btn btn-primary btn-full" id="auth-submit">Sign In</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main App -->
+  <div id="app" class="app-layout hidden">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-icon">⚡</span>
+          <span class="brand-name">CodeSage</span>
+        </div>
+        <button class="icon-btn" id="new-chat-btn" title="New Chat (Ctrl+N)" onclick="newChat()">+</button>
+      </div>
+
+      <!-- Workspace Selector -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <span>WORKSPACE</span>
+          <button class="icon-btn" onclick="showWorkspaceModal()" title="Add workspace">+</button>
+        </div>
+        <div id="workspace-selector" class="workspace-selector">
+          <div class="workspace-empty">No workspace selected</div>
+        </div>
+      </div>
+
+      <!-- Chat Search -->
+      <div class="sidebar-search">
+        <input type="text" id="chat-search" placeholder="Search chats..." oninput="filterChats(this.value)" />
+      </div>
+
+      <!-- Conversations -->
+      <div class="sidebar-section flex-1">
+        <div class="sidebar-section-header"><span>CHATS</span></div>
+        <div id="conversations-list" class="conversations-list">
+          <div class="sidebar-loading">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div class="sidebar-bottom">
+        <button class="sidebar-user-btn" id="user-btn" onclick="showSettings()">
+          <div class="user-avatar" id="user-avatar">U</div>
+          <div class="user-info">
+            <div class="user-name" id="user-name">Loading...</div>
+            <div class="user-email" id="user-email"></div>
+          </div>
+          <span class="settings-icon">⚙</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <main class="chat-area" id="chat-area">
+      <!-- Chat Header -->
+      <div class="chat-header">
+        <button class="icon-btn sidebar-toggle" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
+        <div class="chat-title-area">
+          <h2 id="chat-title" class="chat-title">New Chat</h2>
+        </div>
+        <div class="chat-header-actions">
+          <!-- Model Selector -->
+          <div class="model-selector-container" id="model-selector-container">
+            <button class="model-selector-btn" id="model-selector-btn" onclick="toggleModelSelector()">
+              <span id="current-provider-label">Select Model</span>
+              <span class="chevron">▾</span>
+            </button>
+            <div class="model-selector-dropdown hidden" id="model-dropdown">
+              <div id="model-dropdown-content">Loading providers...</div>
+            </div>
+          </div>
+          <!-- Mode Toggle -->
+          <div class="mode-toggle">
+            <button class="mode-btn active" id="mode-quick" onclick="setMode('quick')" title="Quick Answer">Quick</button>
+            <button class="mode-btn" id="mode-deep" onclick="setMode('deep')" title="Deep Investigation">Deep</button>
+          </div>
+          <!-- Repo Context Toggle -->
+          <button class="icon-btn repo-toggle-btn" id="repo-context-btn" onclick="toggleRepoContext()" title="Use repository context">
+            <span id="repo-context-icon">📁</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Messages -->
+      <div class="messages-container" id="messages-container">
+        <!-- Empty state -->
+        <div class="empty-state" id="empty-state">
+          <div class="empty-icon">⚡</div>
+          <h2>Start building with AI</h2>
+          <p>Ask anything about your codebase, debug issues, or request code changes.</p>
+          <div class="suggestions-grid">
+            <button class="suggestion-btn" onclick="sendSuggestion('Explain this project\'s architecture')">Explain this project</button>
+            <button class="suggestion-btn" onclick="sendSuggestion('Find potential security vulnerabilities')">Find security issues</button>
+            <button class="suggestion-btn" onclick="sendSuggestion('How does authentication work in this codebase?')">Explain auth flow</button>
+            <button class="suggestion-btn" onclick="sendSuggestion('Add unit tests for the main service')">Add unit tests</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chat Input -->
+      <div class="chat-input-area">
+        <div class="chat-input-container">
+          <textarea
+            id="chat-input"
+            class="chat-textarea"
+            placeholder="Ask anything about your code... (Ctrl+Enter to send)"
+            rows="1"
+            onkeydown="handleInputKeydown(event)"
+            oninput="autoResizeTextarea(this)"
+          ></textarea>
+          <div class="chat-input-actions">
+            <div class="input-status" id="input-status"></div>
+            <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Send (Ctrl+Enter)">
+              <span class="send-icon">↑</span>
+            </button>
+          </div>
+        </div>
+        <div class="chat-input-footer">
+          <span id="repo-context-status" class="context-status"></span>
+          <span class="token-hint" id="token-hint"></span>
+        </div>
+      </div>
+    </main>
+
+    <!-- Context Panel -->
+    <aside class="context-panel" id="context-panel">
+      <div class="context-panel-header">
+        <div class="context-tabs">
+          <button class="context-tab active" onclick="switchContextTab('activity')" data-tab="activity">Activity</button>
+          <button class="context-tab" onclick="switchContextTab('files')" data-tab="files">Files</button>
+          <button class="context-tab" onclick="switchContextTab('changes')" data-tab="changes">Changes</button>
+          <button class="context-tab" onclick="switchContextTab('git')" data-tab="git">Git</button>
+        </div>
+        <button class="icon-btn" onclick="toggleContextPanel()" title="Collapse panel">×</button>
+      </div>
+
+      <div class="context-panel-body">
+        <!-- Activity Tab -->
+        <div class="context-tab-content active" id="tab-activity">
+          <div id="activity-log" class="activity-log">
+            <div class="activity-empty">No activity yet</div>
+          </div>
+        </div>
+
+        <!-- Files Tab -->
+        <div class="context-tab-content" id="tab-files">
+          <div class="files-search">
+            <input type="text" placeholder="Filter files..." id="file-filter" oninput="filterFiles(this.value)" />
+          </div>
+          <div id="file-tree" class="file-tree">
+            <div class="files-empty">Index a workspace to browse files</div>
+          </div>
+        </div>
+
+        <!-- Changes Tab -->
+        <div class="context-tab-content" id="tab-changes">
+          <div id="changes-panel" class="changes-panel">
+            <div class="changes-empty">No changes yet</div>
+          </div>
+        </div>
+
+        <!-- Git Tab -->
+        <div class="context-tab-content" id="tab-git">
+          <div class="git-panel" id="git-panel">
+            <div class="git-empty">Select a workspace to see git info</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Modals -->
+  <!-- Workspace Modal -->
+  <div class="modal-overlay hidden" id="workspace-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Add Workspace</h3>
+        <button class="icon-btn" onclick="closeModal('workspace-modal')">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="ws-name">Workspace Name</label>
+          <input type="text" id="ws-name" placeholder="My Project" />
+        </div>
+        <div class="form-group">
+          <label for="ws-path">Repository Path</label>
+          <input type="text" id="ws-path" placeholder="/path/to/your/project" />
+          <small>Absolute path to a local directory</small>
+        </div>
+        <div id="ws-error" class="auth-error hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('workspace-modal')">Cancel</button>
+        <button class="btn btn-primary" id="ws-submit-btn" onclick="createWorkspace()">Add Workspace</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Permission Dialog -->
+  <div class="modal-overlay hidden" id="permission-modal">
+    <div class="modal modal-permission">
+      <div class="modal-header">
+        <div class="permission-icon" id="permission-icon">🔐</div>
+        <h3 id="permission-title">AI wants to execute a command</h3>
+      </div>
+      <div class="modal-body">
+        <div class="permission-command" id="permission-command"></div>
+        <div class="permission-reason" id="permission-reason"></div>
+      </div>
+      <div class="modal-footer permission-actions">
+        <button class="btn btn-danger" onclick="rejectPermission()">Reject</button>
+        <button class="btn btn-secondary" onclick="allowPermissionSession()">Allow for Session</button>
+        <button class="btn btn-primary" onclick="allowPermission()">Allow Once</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Diff Viewer Modal -->
+  <div class="modal-overlay hidden" id="diff-modal">
+    <div class="modal modal-diff">
+      <div class="modal-header">
+        <div>
+          <h3 id="diff-file-path"></h3>
+          <div id="diff-explanation" class="diff-explanation"></div>
+        </div>
+        <button class="icon-btn" onclick="closeDiffModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div id="diff-viewer" class="diff-viewer"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-danger" onclick="rejectDiff()">Reject Changes</button>
+        <button class="btn btn-primary" onclick="acceptDiff()">Accept Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay hidden" id="settings-modal">
+    <div class="modal modal-settings">
+      <div class="modal-header">
+        <h3>Settings</h3>
+        <button class="icon-btn" onclick="closeModal('settings-modal')">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-nav">
+          <button class="settings-nav-btn active" data-section="account" onclick="switchSettingsSection('account')">Account</button>
+          <button class="settings-nav-btn" data-section="ai" onclick="switchSettingsSection('ai')">AI & Models</button>
+          <button class="settings-nav-btn" data-section="permissions" onclick="switchSettingsSection('permissions')">Permissions</button>
+          <button class="settings-nav-btn" data-section="usage" onclick="switchSettingsSection('usage')">Usage</button>
+          <button class="settings-nav-btn" data-section="appearance" onclick="switchSettingsSection('appearance')">Appearance</button>
+        </div>
+        <div class="settings-content" id="settings-content">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command Palette -->
+  <div class="modal-overlay hidden" id="command-palette-overlay" onclick="closeCommandPalette()">
+    <div class="command-palette" onclick="event.stopPropagation()">
+      <input type="text" id="palette-input" placeholder="Search commands..." oninput="filterPalette(this.value)" onkeydown="handlePaletteKey(event)" />
+      <div id="palette-results" class="palette-results"></div>
+    </div>
+  </div>
+
+  <script src="src/api.js"></script>
+  <script src="src/store.js"></script>
+  <script src="src/components/DiffViewer.js"></script>
+  <script src="src/components/ModelSelector.js"></script>
+  <script src="src/components/ActivityLog.js"></script>
+  <script src="src/components/CommandPalette.js"></script>
+  <script src="src/main.js"></script>
+</body>
+</html>
