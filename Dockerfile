@@ -1,27 +1,36 @@
 FROM python:3.11-slim
 
-# Install system dependencies including git
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
+# git is used for repository status, checkpoints and cloning workspaces
+RUN apt-get update && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install python dependencies
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Copy backend and frontend source code
 COPY backend ./backend
 COPY frontend ./frontend
 
-# Set Python path to include backend
-ENV PYTHONPATH=/app/backend
-ENV PORT=5000
-ENV FLASK_ENV=production
+# Run as an unprivileged user; all mutable state lives under /app/data
+RUN useradd --create-home --uid 1000 codesage \
+    && mkdir -p /app/data/workspaces /app/data/index_cache \
+    && chown -R codesage:codesage /app/data
+USER codesage
+
+ENV PYTHONPATH=/app/backend \
+    PYTHONUNBUFFERED=1 \
+    PORT=5000 \
+    FLASK_ENV=production \
+    DATABASE_URL=sqlite:////app/data/codesage.db \
+    WORKSPACE_ROOT=/app/data/workspaces \
+    INDEX_CACHE_DIR=/app/data/index_cache \
+    OLLAMA_ENABLED=false
 
 EXPOSE 5000
+VOLUME ["/app/data"]
 
-# Run with Gunicorn using gevent/sync worker
-CMD ["gunicorn", "--chdir", "backend", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "wsgi:app"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS "http://localhost:${PORT}/health" || exit 1
+
+CMD ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn.conf.py", "wsgi:app"]

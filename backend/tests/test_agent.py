@@ -6,8 +6,11 @@ from app.agent.executor import compute_diff, apply_file_edit, _is_within
 def test_detect_intent():
     assert detect_intent("what is a closure in python?") == "general"
     assert detect_intent("explain how the codebase is structured") == "repository"
+    assert detect_intent("explain the project what this is doing") == "repository"
     assert detect_intent("add a multiplication function to the math module") == "modification"
     assert detect_intent("fix the null pointer exception") == "modification"
+    assert detect_intent("what i want in this add a requirment python and change the version of sciketlearn") == "modification"
+    assert detect_intent("in requirment file add one more requirment that is python nothing else") == "modification"
 
 
 def test_compute_diff():
@@ -31,7 +34,9 @@ def test_apply_file_edit(temp_repo):
     res = apply_file_edit(temp_repo, calc_path, new_content)
 
     assert res["ok"] is True
-    assert os.path.exists(abs_calc + ".bak")
+    # no backup litter in the user's repo — originals are kept by the proposal record
+    assert not os.path.exists(abs_calc + ".bak")
+    assert res["verification"][0]["ok"] is True
 
     with open(abs_calc, "r", encoding="utf-8") as f:
         assert "multiply" in f.read()

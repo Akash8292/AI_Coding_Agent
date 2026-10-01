@@ -83,3 +83,29 @@ def test_usage_endpoint(client, auth_headers):
     assert "requests" in data
     assert "total_tokens" in data
     assert "cost_usd" in data
+
+
+def test_chat_cancel_missing_req_id(client, auth_headers):
+    res = client.post("/api/chat/cancel", headers=auth_headers, json={})
+    assert res.status_code == 400
+    assert res.get_json()["ok"] is False
+
+
+def test_chat_cancel_not_found(client, auth_headers):
+    res = client.post("/api/chat/cancel", headers=auth_headers, json={"request_id": "nonexistent_req_123"})
+    assert res.status_code == 404
+    assert res.get_json()["ok"] is False
+
+
+def test_chat_cancel_active_request(client, auth_headers):
+    from app.api.chat import _register_request, _unregister_request, _is_cancelled
+    ev = _register_request("test_req_active_456")
+    try:
+        assert not _is_cancelled(ev)
+        res = client.post("/api/chat/cancel", headers=auth_headers, json={"request_id": "test_req_active_456"})
+        assert res.status_code == 200
+        assert res.get_json()["ok"] is True
+        assert _is_cancelled(ev)
+    finally:
+        _unregister_request("test_req_active_456")
+

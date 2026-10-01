@@ -4,9 +4,9 @@
  */
 
 const API = (() => {
-  const BASE_URL = window.location.origin.includes('5000') 
-    ? '' 
-    : (window.CODER_API_URL || 'http://localhost:5000');
+  // The backend serves this frontend, so API calls are same-origin by default.
+  // Set window.CODESAGE_API_URL before this script to point at a separate API host.
+  const BASE_URL = (window.CODESAGE_API_URL || '').replace(/\/$/, '');
 
   function getToken() {
     return localStorage.getItem('codesage_token') || '';
@@ -96,10 +96,10 @@ const API = (() => {
     return request('/api/workspaces');
   }
 
-  async function createWorkspace(name, repo_path) {
+  async function createWorkspace(name, repo_path, git_url) {
     return request('/api/workspaces', {
       method: 'POST',
-      body: JSON.stringify({ name, repo_path }),
+      body: JSON.stringify({ name, repo_path, git_url }),
     });
   }
 
@@ -111,8 +111,8 @@ const API = (() => {
     return request(`/api/workspaces/${id}`, { method: 'DELETE' });
   }
 
-  async function indexWorkspace(id) {
-    return request(`/api/workspaces/${id}/index`, { method: 'POST' });
+  async function indexWorkspace(id, force = false) {
+    return request(`/api/workspaces/${id}/index`, { method: 'POST', body: JSON.stringify({ force }) });
   }
 
   async function getIndexStatus(id) {
@@ -147,8 +147,12 @@ const API = (() => {
     });
   }
 
-  async function restoreGitCheckpoint(id) {
-    return request(`/api/workspaces/${id}/git/restore`, { method: 'POST' });
+  async function restoreGitCheckpoint(id, sha) {
+    return request(`/api/workspaces/${id}/git/restore`, { method: 'POST', body: JSON.stringify({ sha }) });
+  }
+
+  async function listGitCheckpoints(id) {
+    return request(`/api/workspaces/${id}/git/checkpoints`);
   }
 
   // Conversations
@@ -182,95 +186,102 @@ const API = (() => {
   }
 
   // Chat Streaming (SSE)
-  async function streamChat({ conversation_id, message, provider, model, use_repo, workspace_id, mode }, { onActivity, onChunk, onDone, onError }) {
-    const url = `${BASE_URL}/api/chat`;
+  // handlers: onStart, onPlan, onActivity, onChunk, onProgress, onProposal, onCommand,
+  //           onDone, onCancelled, onError. Pass `signal` (AbortController) to abort.
+  async function streamChat(body, handlers = {}, signal = undefined) {
+    const headers = { 'Content-Type': 'application/json' };
     const token = getToken();
-    const headers = {
-      'Content-Type': 'application/json',
-    };
     if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (body.request_id) headers['X-Request-ID'] = body.request_id;
 
-    const body = JSON.stringify({
-      conversation_id,
-      message,
-      provider,
-      model,
-      use_repo,
-      workspace_id,
-      mode,
-    });
+    let terminal = false;
+    const dispatch = (event) => {
+      const map = {
+        start: 'onStart', plan: 'onPlan', activity: 'onActivity', chunk: 'onChunk',
+        progress: 'onProgress', proposal: 'onProposal', command: 'onCommand',
+        done: 'onDone', cancelled: 'onCancelled', error: 'onError',
+      };
+      if (['done', 'cancelled', 'error'].includes(event.type)) terminal = true;
+      const fn = handlers[map[event.type]];
+      if (!fn) return;
+      if (event.type === 'error') {
+        const err = new Error(event.message || 'Request failed');
+        err.kind = event.kind; err.retryable = event.retryable; err.message_id = event.message_id;
+        fn(err);
+      } else if (event.type === 'chunk') {
+        fn(event.content);
+      } else if (event.type === 'activity') {
+        fn(event.items);
+      } else {
+        fn(event);
+      }
+    };
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body,
+      const response = await fetch(`${BASE_URL}/api/chat`, {
+        method: 'POST', headers, body: JSON.stringify(body), signal,
       });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `Error ${response.status}: ${response.statusText}`);
+      if (response.status === 401 && typeof window.onAuthUnauthorized === 'function') {
+        clearToken();
+        window.onAuthUnauthorized();
       }
-
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        const err = new Error(data.error || `Error ${response.status}: ${response.statusText}`);
+        err.kind = data.kind || `http_${response.status}`;
+        err.retryable = response.status === 429 || response.status >= 500;
+        throw err;
+      }
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
-
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep partial line in buffer
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          const jsonStr = trimmed.substring(6);
-          try {
-            const event = JSON.parse(jsonStr);
-            if (event.type === 'activity' && onActivity) {
-              onActivity(event.items);
-            } else if (event.type === 'chunk' && onChunk) {
-              onChunk(event.content);
-            } else if (event.type === 'done' && onDone) {
-              onDone(event);
-            } else if (event.type === 'error' && onError) {
-              onError(new Error(event.message || 'Stream error'));
+        let idx;
+        while ((idx = buffer.indexOf('\n\n')) !== -1) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data: ')) continue;   // ': ping' heartbeats etc.
+            try {
+              dispatch(JSON.parse(line.slice(6)));
+            } catch (e) {
+              console.warn('Bad SSE event', line, e);
             }
-          } catch (e) {
-            console.warn('Failed to parse SSE line:', line, e);
           }
         }
       }
+      if (!terminal) {
+        const err = new Error('The connection closed before the response finished.');
+        err.kind = 'connection'; err.retryable = true;
+        throw err;
+      }
     } catch (err) {
-      if (onError) onError(err);
+      if (err.name === 'AbortError') {
+        if (!terminal && handlers.onCancelled) handlers.onCancelled({ aborted: true });
+        return;
+      }
+      if (handlers.onError) handlers.onError(err);
       else throw err;
     }
   }
 
-  // Code actions
-  async function proposeEdit(workspace_id, path, instruction, provider, model) {
-    return request('/api/propose_edit', {
-      method: 'POST',
-      body: JSON.stringify({ workspace_id, path, instruction, provider, model }),
-    });
+  async function cancelChat(request_id) {
+    return request('/api/chat/cancel', { method: 'POST', body: JSON.stringify({ request_id }) });
   }
 
-  async function applyEdit(workspace_id, path, content) {
-    return request('/api/apply_edit', {
-      method: 'POST',
-      body: JSON.stringify({ workspace_id, path, content }),
-    });
-  }
+  // Proposed changes (review workflow)
+  const getChange = (id, withContent = false) => request(`/api/changes/${id}${withContent ? '?content=1' : ''}`);
+  const applyChange = (id) => request(`/api/changes/${id}/apply`, { method: 'POST' });
+  const rejectChange = (id) => request(`/api/changes/${id}/reject`, { method: 'POST' });
+  const revertChange = (id) => request(`/api/changes/${id}/revert`, { method: 'POST' });
+  const listConversationChanges = (convId) => request(`/api/conversations/${convId}/changes`);
 
-  async function diagnose(workspace_id, problem, provider, model) {
-    return request('/api/diagnose', {
-      method: 'POST',
-      body: JSON.stringify({ workspace_id, problem, provider, model }),
-    });
-  }
+  // Commands (permission workflow)
+  const approveCommand = (id) => request(`/api/commands/${id}/approve`, { method: 'POST' });
+  const rejectCommand = (id) => request(`/api/commands/${id}/reject`, { method: 'POST' });
 
   // Metadata & System
   async function getModels() {
@@ -313,9 +324,15 @@ const API = (() => {
     updateConversation,
     deleteConversation,
     streamChat,
-    proposeEdit,
-    applyEdit,
-    diagnose,
+    cancelChat,
+    getChange,
+    applyChange,
+    rejectChange,
+    revertChange,
+    listConversationChanges,
+    approveCommand,
+    rejectCommand,
+    listGitCheckpoints,
     getModels,
     getUsage,
     getHealth,

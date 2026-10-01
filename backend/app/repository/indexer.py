@@ -1,51 +1,59 @@
 """
 Repository file indexer.
-Walks a repo, chunks source files, and optionally generates embeddings.
-Primary mode: keyword indexing (no external dependencies).
-Optional: semantic embeddings via OpenAI or Ollama.
 
-Per-workspace state is stored on disk (not in RAM), so it survives restarts.
+Walks a repo (git-aware: respects .gitignore), chunks source files, and builds
+a BM25 keyword index. Optional semantic embeddings via OpenAI or Ollama.
+
+The index is persisted per workspace on disk and kept FRESH: every search
+calls refresh_index(), which stats the tracked files and re-chunks only those
+whose mtime/size changed (or that were added/removed) — so answers never use
+stale code after an edit is applied.
 """
 import hashlib
-import json
+import logging
 import math
 import os
 import pickle
 import re
 import threading
-from collections import defaultdict
+import time
+from collections import Counter
 from typing import Optional
 
-IGNORE_DIRS = {
-    ".git", "node_modules", "__pycache__", "venv", ".venv", "env",
-    "dist", "build", ".next", "target", ".idea", ".vscode",
-    "coverage", ".pytest_cache", ".mypy_cache", "index_cache",
-    ".tox", ".eggs", "*.egg-info",
-}
+from app.repository import workspace_fs
+
+logger = logging.getLogger(__name__)
+
+IGNORE_DIRS = workspace_fs.IGNORE_DIRS
 ALLOWED_EXT = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".c",
-    ".h", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt",
-    ".scala", ".sh", ".sql", ".html", ".css", ".scss", ".md", ".json",
-    ".yaml", ".yml", ".toml", ".env.example",
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java", ".go", ".rs", ".c",
+    ".h", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh",
+    ".bash", ".ps1", ".sql", ".html", ".htm", ".css", ".scss", ".sass", ".less", ".vue",
+    ".svelte", ".md", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".xml", ".gradle", ".proto", ".graphql", ".tf", ".dart", ".lua", ".r", ".ex", ".exs",
 }
+ALLOWED_NAMES = {"dockerfile", "makefile", "procfile", "gemfile", "rakefile", "jenkinsfile",
+                 ".env.example", "requirements.txt"}
 MAX_FILE_BYTES = 500_000
 CHUNK_LINES = 60
 CHUNK_OVERLAP = 10
+INDEX_VERSION = 3
 
 # Per-workspace in-progress status (not persisted)
 _status_lock = threading.Lock()
 _status: dict = {}  # workspace_id -> status dict
 
+# In-memory copy of loaded indexes + per-workspace refresh locks
+_mem_lock = threading.Lock()
+_mem: dict[str, dict] = {}
+_ws_locks: dict[str, threading.Lock] = {}
+
 
 def _get_cache_dir(cfg=None) -> str:
-    if cfg:
-        d = cfg.get("INDEX_CACHE_DIR", "")
-        if d:
-            os.makedirs(d, exist_ok=True)
-            return d
-    default = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "index_cache")
-    os.makedirs(default, exist_ok=True)
-    return default
+    d = (cfg.get("INDEX_CACHE_DIR", "") if cfg else "") or \
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "index_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _cache_path(workspace_id: int, repo_path: str, cfg=None) -> str:
@@ -53,88 +61,124 @@ def _cache_path(workspace_id: int, repo_path: str, cfg=None) -> str:
     return os.path.join(_get_cache_dir(cfg), f"ws_{workspace_id}_{h}.pkl")
 
 
-def _iter_files(repo_path: str):
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith(".")]
-        for fname in files:
-            ext = os.path.splitext(fname)[1].lower()
-            if ext not in ALLOWED_EXT:
-                continue
-            fpath = os.path.join(root, fname)
-            try:
-                if os.path.getsize(fpath) > MAX_FILE_BYTES:
-                    continue
-            except OSError:
-                continue
-            yield fpath
+def _lock_for(cache_file: str) -> threading.Lock:
+    with _mem_lock:
+        return _ws_locks.setdefault(cache_file, threading.Lock())
 
 
-def _chunk_file(fpath: str, repo_path: str) -> list[dict]:
+# ── Tokenisation ────────────────────────────────────────────────────────────
+
+_SUFFIXES = ("izations", "ization", "ications", "ication", "ations", "ation", "ements", "ement",
+             "ities", "ity", "ingly", "ings", "ing", "ated", "ates", "ate", "ions", "ion",
+             "ers", "er", "ed", "es", "s")
+_CAMEL = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def stem(word: str) -> str:
+    for suf in _SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 4:
+            return word[: -len(suf)]
+    return word
+
+
+def tokenize(text: str) -> list[str]:
+    """Identifiers plus their snake/camel parts, lowercased and lightly stemmed."""
+    out = []
+    for ident in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        low = ident.lower()
+        out.append(stem(low))
+        parts = [p for chunk in ident.split("_") for p in _CAMEL.findall(chunk)]
+        if len(parts) > 1:
+            out.extend(stem(p.lower()) for p in parts if len(p) > 2)
+    return out
+
+
+# ── File discovery / chunking ───────────────────────────────────────────────
+
+def _indexable(rel: str) -> bool:
+    name = os.path.basename(rel).lower()
+    ext = os.path.splitext(name)[1]
+    return ext in ALLOWED_EXT or name in ALLOWED_NAMES
+
+
+def _iter_files(repo_path: str) -> list[str]:
+    """Relative paths of indexable files (git-aware, secrets excluded)."""
+    out = []
+    for rel in workspace_fs.list_files(repo_path):
+        if not _indexable(rel):
+            continue
+        try:
+            if os.path.getsize(os.path.join(repo_path, rel)) > MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        out.append(rel)
+    return out
+
+
+def _chunk_file(rel: str, repo_path: str) -> list[dict]:
+    if os.path.isabs(rel):
+        rel = os.path.relpath(rel, repo_path).replace("\\", "/")
     try:
-        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
+        text = workspace_fs.read_text(repo_path, rel, MAX_FILE_BYTES)
+    except (OSError, workspace_fs.WorkspacePathError):
         return []
-
+    lines = text.splitlines(keepends=True)
     if not lines:
         return []
-
-    rel = os.path.relpath(fpath, repo_path).replace("\\", "/")
     chunks = []
     step = max(CHUNK_LINES - CHUNK_OVERLAP, 1)
     for start in range(0, len(lines), step):
         end = min(start + CHUNK_LINES, len(lines))
-        text = "".join(lines[start:end]).strip()
-        if text:
-            chunks.append({
-                "file": rel,
-                "start_line": start + 1,
-                "end_line": end,
-                "text": text,
-            })
+        body = "".join(lines[start:end]).strip()
+        if body:
+            chunks.append({"file": rel, "start_line": start + 1, "end_line": end, "text": body})
         if end >= len(lines):
             break
     return chunks
 
 
+def _file_sig(repo_path: str, rel: str) -> Optional[tuple]:
+    try:
+        st = os.stat(os.path.join(repo_path, rel))
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def _build_keyword_index(chunks: list[dict]) -> dict:
-    """Build a simple inverted index for BM25-style keyword search."""
-    # Tokenize
-    def tokenize(text: str) -> list[str]:
-        return re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text.lower())
-
-    # Document frequency
-    df = defaultdict(int)
-    doc_tokens = []
+    df: Counter = Counter()
+    doc_tf = []
+    doc_len = []
     for chunk in chunks:
-        tokens = set(tokenize(chunk["text"] + " " + chunk["file"]))
-        doc_tokens.append(list(tokenize(chunk["text"] + " " + chunk["file"])))
-        for t in tokens:
-            df[t] += 1
+        toks = tokenize(chunk["text"]) + tokenize(chunk["file"]) * 3  # path terms weigh more
+        tf = Counter(toks)
+        doc_tf.append(tf)
+        doc_len.append(len(toks))
+        df.update(tf.keys())
+    n = len(chunks)
+    return {"df": dict(df), "doc_tf": doc_tf, "doc_len": doc_len, "N": n,
+            "avg_dl": (sum(doc_len) / n) if n else 0.0}
 
-    N = len(chunks)
-    avg_dl = sum(len(t) for t in doc_tokens) / max(N, 1)
 
-    return {"df": dict(df), "doc_tokens": doc_tokens, "N": N, "avg_dl": avg_dl}
-
-
-def bm25_score(query_tokens: list[str], doc_tokens: list[str],
-               df: dict, N: int, avg_dl: float,
-               k1: float = 1.5, b: float = 0.75) -> float:
-    dl = len(doc_tokens)
-    tf_map = defaultdict(int)
-    for t in doc_tokens:
-        tf_map[t] += 1
-
+def bm25_score(query_tokens: list[str], doc_tf, df: dict, N: int, avg_dl: float,
+               k1: float = 1.5, b: float = 0.75, dl: Optional[int] = None) -> float:
+    if isinstance(doc_tf, list):  # legacy: list of tokens
+        dl = len(doc_tf)
+        doc_tf = Counter(doc_tf)
+    dl = dl if dl is not None else sum(doc_tf.values())
     score = 0.0
     for term in query_tokens:
-        if term not in tf_map:
+        tf = doc_tf.get(term, 0)
+        if not tf:
             continue
-        tf = tf_map[term]
-        idf = math.log((N - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1)
-        score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
+        d = df.get(term, 0)
+        idf = math.log((N - d + 0.5) / (d + 0.5) + 1)
+        score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / max(avg_dl, 1e-9)))
     return score
 
+
+# ── Status ──────────────────────────────────────────────────────────────────
 
 def get_status(workspace_id: int) -> dict:
     with _status_lock:
@@ -143,113 +187,165 @@ def get_status(workspace_id: int) -> dict:
 
 def _set_status(workspace_id: int, **kwargs):
     with _status_lock:
-        if workspace_id not in _status:
-            _status[workspace_id] = {"status": "idle"}
-        _status[workspace_id].update(kwargs)
+        _status.setdefault(workspace_id, {"status": "idle"}).update(kwargs)
 
+
+# ── Build / load / refresh ──────────────────────────────────────────────────
 
 def start_indexing(workspace_id: int, repo_path: str, cfg=None,
-                   on_complete=None) -> str:
+                   on_complete=None, force: bool = False) -> str:
     """
-    Start background indexing for workspace_id.
-    Returns 'cached' if a fresh cache exists, 'started' otherwise.
+    Start background indexing. Returns 'cached' if a usable index exists
+    (it is refreshed incrementally in the background), 'started' otherwise.
     on_complete: optional callback(workspace_id, total_files, total_chunks)
     """
     repo_path = os.path.abspath(repo_path)
     if not os.path.isdir(repo_path):
         raise ValueError(f"Not a directory: {repo_path}")
-
     cache_file = _cache_path(workspace_id, repo_path, cfg)
-    if os.path.exists(cache_file):
+    existing = None if force else load_index(workspace_id, repo_path, cfg)
+    _set_status(workspace_id, status="indexing", path=repo_path, total_files=0,
+                indexed_files=0, total_chunks=0, error=None)
+
+    def work():
         try:
-            with open(cache_file, "rb") as f:
-                cached = pickle.load(f)
-            _set_status(workspace_id, status="done", path=repo_path,
-                        total_files=cached.get("total_files", 0),
-                        total_chunks=len(cached.get("chunks", [])),
-                        error=None)
+            if existing is not None:
+                data = refresh_index(workspace_id, repo_path, cfg)
+            else:
+                data = _run_index(workspace_id, repo_path, cache_file, cfg)
+            total_files = data.get("total_files", 0) if data else 0
+            total_chunks = len(data.get("chunks", [])) if data else 0
+            _set_status(workspace_id, status="done", total_files=total_files,
+                        indexed_files=total_files, total_chunks=total_chunks)
             if on_complete:
-                on_complete(workspace_id, cached.get("total_files", 0),
-                            len(cached.get("chunks", [])))
-            return "cached"
-        except Exception:
-            pass  # Fall through to re-index
+                on_complete(workspace_id, total_files, total_chunks)
+        except Exception as e:
+            logger.exception("[index] workspace %s failed", workspace_id)
+            _set_status(workspace_id, status="error", error=str(e))
 
-    _set_status(workspace_id, status="indexing", path=repo_path,
-                total_files=0, indexed_files=0, total_chunks=0, error=None)
-
-    t = threading.Thread(
-        target=_run_index,
-        args=(workspace_id, repo_path, cache_file, cfg, on_complete),
-        daemon=True,
-    )
-    t.start()
-    return "started"
+    threading.Thread(target=work, daemon=True).start()
+    return "cached" if existing is not None else "started"
 
 
 def _run_index(workspace_id: int, repo_path: str, cache_file: str,
-               cfg=None, on_complete=None):
-    try:
-        files = list(_iter_files(repo_path))
+               cfg=None, on_complete=None) -> dict:
+    """Full (re)index. Also used synchronously as a fallback by search()."""
+    with _lock_for(cache_file):
+        files = _iter_files(repo_path)
         _set_status(workspace_id, total_files=len(files))
+        all_chunks: list[dict] = []
+        sigs = {}
+        for i, rel in enumerate(files):
+            all_chunks.extend(_chunk_file(rel, repo_path))
+            sigs[rel] = _file_sig(repo_path, rel)
+            if i % 50 == 0:
+                _set_status(workspace_id, indexed_files=i + 1, total_chunks=len(all_chunks))
+        data = _assemble(all_chunks, sigs, repo_path, cfg)
+        _save(cache_file, data)
+    if on_complete:
+        on_complete(workspace_id, len(files), len(all_chunks))
+    return data
 
-        all_chunks = []
-        for i, fpath in enumerate(files):
-            all_chunks.extend(_chunk_file(fpath, repo_path))
-            _set_status(workspace_id, indexed_files=i + 1, total_chunks=len(all_chunks))
 
-        keyword_index = _build_keyword_index(all_chunks)
+def _assemble(chunks: list[dict], sigs: dict, repo_path: str, cfg) -> dict:
+    embeddings = None
+    provider = (cfg or {}).get("EMBEDDING_PROVIDER", "none") if cfg else "none"
+    if provider == "openai" and cfg and cfg.get("OPENAI_API_KEY"):
+        embeddings = _embed_openai(chunks, cfg)
+    elif provider == "ollama":
+        embeddings = _embed_ollama(chunks, cfg)
+    return {
+        "version": INDEX_VERSION,
+        "chunks": chunks,
+        "keyword_index": _build_keyword_index(chunks),
+        "embeddings": embeddings,
+        "files": sigs,
+        "total_files": len(sigs),
+        "repo_path": repo_path,
+        "built_at": time.time(),
+    }
 
-        # Optional: generate embeddings
-        embeddings = None
-        embedding_provider = (cfg or {}).get("EMBEDDING_PROVIDER", "none") if cfg else "none"
-        if embedding_provider == "openai" and cfg and cfg.get("OPENAI_API_KEY"):
-            embeddings = _embed_openai(all_chunks, cfg)
-        elif embedding_provider == "ollama":
-            embeddings = _embed_ollama(all_chunks, cfg)
 
-        data = {
-            "chunks": all_chunks,
-            "keyword_index": keyword_index,
-            "embeddings": embeddings,
-            "total_files": len(files),
-            "repo_path": repo_path,
-        }
+def _save(cache_file: str, data: dict) -> None:
+    tmp = cache_file + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, cache_file)
+    with _mem_lock:
+        _mem[cache_file] = {"data": data, "mtime": os.path.getmtime(cache_file)}
 
-        with open(cache_file, "wb") as f:
-            pickle.dump(data, f)
 
-        _set_status(workspace_id, status="done", total_chunks=len(all_chunks))
-        if on_complete:
-            on_complete(workspace_id, len(files), len(all_chunks))
+def load_index(workspace_id: int, repo_path: str, cfg=None) -> Optional[dict]:
+    """Load the index (memory first, then disk). None if absent or outdated format."""
+    cache_file = _cache_path(workspace_id, repo_path, cfg)
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        mtime = os.path.getmtime(cache_file)
+        with _mem_lock:
+            hit = _mem.get(cache_file)
+        if hit and hit["mtime"] == mtime:
+            return hit["data"]
+        with open(cache_file, "rb") as f:
+            data = pickle.load(f)
+        if data.get("version") != INDEX_VERSION:
+            return None
+        with _mem_lock:
+            _mem[cache_file] = {"data": data, "mtime": mtime}
+        return data
+    except Exception:
+        return None
 
-    except Exception as e:
-        _set_status(workspace_id, status="error", error=str(e))
+
+def refresh_index(workspace_id: int, repo_path: str, cfg=None) -> Optional[dict]:
+    """
+    Bring the index up to date with the working tree. Cheap when nothing
+    changed (one stat per file); otherwise re-chunks only changed files.
+    """
+    cache_file = _cache_path(workspace_id, repo_path, cfg)
+    data = load_index(workspace_id, repo_path, cfg)
+    if data is None:
+        return _run_index(workspace_id, repo_path, cache_file, cfg)
+    with _lock_for(cache_file):
+        data = load_index(workspace_id, repo_path, cfg) or data
+        current = {rel: _file_sig(repo_path, rel) for rel in _iter_files(repo_path)}
+        old = data.get("files", {})
+        changed = {rel for rel, sig in current.items() if old.get(rel) != sig}
+        removed = set(old) - set(current)
+        if not changed and not removed:
+            return data
+        keep = [c for c in data["chunks"] if c["file"] not in changed and c["file"] not in removed]
+        for rel in sorted(changed):
+            keep.extend(_chunk_file(rel, repo_path))
+        keep.sort(key=lambda c: (c["file"], c["start_line"]))
+        cfg_no_embed = dict(cfg or {})
+        cfg_no_embed["EMBEDDING_PROVIDER"] = "none"  # embeddings rebuilt only on full re-index
+        new = _assemble(keep, current, repo_path, cfg_no_embed)
+        _save(cache_file, new)
+        logger.info("[index] ws=%s refreshed: %d changed, %d removed", workspace_id,
+                    len(changed), len(removed))
+        return new
 
 
 def _embed_openai(chunks: list[dict], cfg: dict) -> Optional[list]:
     """Generate embeddings via OpenAI — only called if configured."""
     try:
         import requests
-        import numpy as np
-        texts = [f"# {c['file']} (lines {c['start_line']}-{c['end_line']})\n{c['text']}"
-                 for c in chunks]
-        # Batch in groups of 100
+        texts = [f"# {c['file']} (lines {c['start_line']}-{c['end_line']})\n{c['text']}" for c in chunks]
         embeddings = []
         for i in range(0, len(texts), 100):
-            batch = texts[i:i + 100]
             r = requests.post(
                 f"{cfg.get('OPENAI_BASE_URL', 'https://api.openai.com/v1')}/embeddings",
                 headers={"Authorization": f"Bearer {cfg['OPENAI_API_KEY']}"},
                 json={"model": cfg.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-                      "input": batch},
-                timeout=60,
+                      "input": texts[i:i + 100]},
+                timeout=(10, 60),
             )
             r.raise_for_status()
-            batch_embeddings = [item["embedding"] for item in r.json()["data"]]
-            embeddings.extend(batch_embeddings)
+            embeddings.extend(item["embedding"] for item in r.json()["data"])
         return embeddings
-    except Exception:
+    except Exception as e:
+        logger.warning("[index] OpenAI embeddings failed: %s", e)
         return None
 
 
@@ -263,36 +359,21 @@ def _embed_ollama(chunks: list[dict], cfg: dict) -> Optional[list]:
         for c in chunks:
             text = f"# {c['file']} (lines {c['start_line']}-{c['end_line']})\n{c['text']}"
             r = requests.post(f"{base_url}/api/embeddings",
-                              json={"model": model, "prompt": text}, timeout=60)
+                              json={"model": model, "prompt": text}, timeout=(3, 60))
             r.raise_for_status()
             embeddings.append(r.json()["embedding"])
         return embeddings
-    except Exception:
-        return None
-
-
-def load_index(workspace_id: int, repo_path: str, cfg=None) -> Optional[dict]:
-    """Load index from cache, or None if not indexed."""
-    cache_file = _cache_path(workspace_id, repo_path, cfg)
-    if not os.path.exists(cache_file):
-        return None
-    try:
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
-    except Exception:
+    except Exception as e:
+        logger.warning("[index] Ollama embeddings failed: %s", e)
         return None
 
 
 def list_files(workspace_id: int, repo_path: str, cfg=None) -> list[dict]:
-    """Return file tree for the workspace."""
+    """File tree for the workspace: every file (not only indexed ones) with line counts."""
     data = load_index(workspace_id, repo_path, cfg)
-    if not data:
-        return []
-    seen = {}
-    for chunk in data["chunks"]:
-        f = chunk["file"]
-        if f not in seen:
-            seen[f] = {"path": f, "lines": chunk["end_line"]}
-        else:
-            seen[f]["lines"] = max(seen[f]["lines"], chunk["end_line"])
-    return sorted(seen.values(), key=lambda x: x["path"])
+    lines: dict[str, int] = {}
+    if data:
+        for chunk in data["chunks"]:
+            lines[chunk["file"]] = max(lines.get(chunk["file"], 0), chunk["end_line"])
+    files = workspace_fs.list_files(repo_path) if os.path.isdir(repo_path) else []
+    return [{"path": f, "lines": lines.get(f)} for f in files]

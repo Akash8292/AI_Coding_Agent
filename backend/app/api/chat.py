@@ -1,25 +1,157 @@
-from flask import Blueprint, request, jsonify, g, Response, stream_with_context, current_app
+"""
+Chat API — POST /api/chat streams an agent run as Server-Sent Events.
+
+Event types (JSON in `data:` lines; `: ping` comments are heartbeats):
+  start      {request_id, conversation_id}
+  plan       {mode, scope, explicit_files, reasons}
+  activity   {items: [{id, text, status, kind, ms, detail}]}
+  chunk      {content}                        answer text
+  progress   {chars}                          edit generation progress
+  proposal   {change}                         reviewed-diff proposal (nothing written yet)
+  command    {command}                        command awaiting permission
+  done       {conversation_id, message_id, metrics}
+  cancelled  {message_id}
+  error      {message, kind, retryable, message_id}
+
+Cancellation: POST /api/chat/cancel {request_id} (owner only) sets the run's
+cancel event; the provider request is aborted and the stream ends with
+`cancelled`. A client disconnect cancels the run the same way.
+"""
+import json
+import logging
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+
+from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
+from sqlalchemy import func
+
+from app.agent.runner import AgentCancelled, AgentError, AgentRun, WorkspaceRef
 from app.auth.utils import require_auth
 from app.database import db
-from app.models.conversation import Conversation, Message
-from app.models.workspace import Workspace
-from app.models.usage import UsageRecord
-from app.llm.factory import ProviderFactory
 from app.llm.base import ProviderNotAvailableError
-from app.agent.context import detect_intent, build_context, build_system_prompt
-from app.agent.planner import BASE_SYSTEM_PROMPT, parse_file_response
-from app.repository import searcher
-import json
+from app.llm.factory import ProviderFactory, record_provider_result
+from app.models.conversation import Conversation, Message, PendingApproval, ProposedChange
+from app.models.usage import UsageRecord
+from app.models.workspace import Workspace
+
+logger = logging.getLogger(__name__)
 
 chat_bp = Blueprint("chat", __name__, url_prefix="/api")
 
+
+# ── Run registry (cancellation + per-user concurrency) ───────────────────────
+
+class _Run:
+    __slots__ = ("user_id", "event", "started")
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.event = threading.Event()
+        self.started = time.time()
+
+
+_runs: dict[str, _Run] = {}
+_runs_lock = threading.Lock()
+
+
+def _register_request(req_id: str, user_id: int = 0) -> threading.Event:
+    run = _Run(user_id)
+    with _runs_lock:
+        _runs[req_id] = run
+    return run.event
+
+
+def _unregister_request(req_id: str) -> None:
+    with _runs_lock:
+        _runs.pop(req_id, None)
+
+
+def _is_cancelled(ev: threading.Event) -> bool:
+    return ev.is_set()
+
+
+def _active_runs(user_id: int) -> int:
+    with _runs_lock:
+        return sum(1 for r in _runs.values() if r.user_id == user_id)
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+# ── Cancel ───────────────────────────────────────────────────────────────────
+
+@chat_bp.route("/chat/cancel", methods=["POST"])
+@require_auth
+def cancel_chat():
+    """POST /api/chat/cancel — cancel a running request (only its owner may)."""
+    body = request.get_json(force=True, silent=True) or {}
+    req_id = (body.get("request_id") or "").strip()
+    if not req_id:
+        return jsonify({"ok": False, "error": "request_id is required"}), 400
+    with _runs_lock:
+        run = _runs.get(req_id)
+    if run is None or (run.user_id and run.user_id != g.current_user.id):
+        return jsonify({"ok": False, "message": "Request not found or already completed"}), 404
+    run.event.set()
+    logger.info("[cancel] request_id=%s cancelled by user=%s", req_id, g.current_user.id)
+    return jsonify({"ok": True, "message": "Cancellation requested"})
+
+
+# ── Limits ───────────────────────────────────────────────────────────────────
+
+def _check_limits(user_id: int, cfg) -> tuple[str, int] | None:
+    now = datetime.now(timezone.utc)
+    max_concurrent = int(cfg.get("MAX_CONCURRENT_REQUESTS_PER_USER", 2))
+    if _active_runs(user_id) >= max_concurrent:
+        return (f"You already have {max_concurrent} request(s) running. Wait for one to finish "
+                "or stop it first.", 429)
+    per_min = int(cfg.get("RATE_LIMIT_REQUESTS_PER_MINUTE", 30))
+    recent = UsageRecord.query.filter(UsageRecord.user_id == user_id,
+                                      UsageRecord.created_at >= now - timedelta(minutes=1)).count()
+    if recent >= per_min:
+        return (f"Rate limit: {per_min} requests per minute. Try again in a moment.", 429)
+    per_day = int(cfg.get("RATE_LIMIT_TOKENS_PER_DAY", 2_000_000))
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    used = db.session.query(func.coalesce(func.sum(UsageRecord.input_tokens + UsageRecord.output_tokens), 0)) \
+        .filter(UsageRecord.user_id == user_id, UsageRecord.created_at >= start_of_day).scalar() or 0
+    if used >= per_day:
+        return (f"Daily token limit reached ({used:,} of {per_day:,}). It resets at 00:00 UTC.", 429)
+    return None
+
+
+def _completed_turns(messages: list) -> list[dict]:
+    """
+    Conversation history for the model: only user turns whose reply completed.
+    A question that was cancelled or failed was abandoned by the user, so it
+    must not leak into (and get merged with) the next question.
+    """
+    out: list[dict] = []
+    for i, m in enumerate(messages):
+        if m.role not in ("user", "assistant") or not m.content:
+            continue
+        if m.role == "assistant":
+            if (m.status or "complete") == "complete":
+                out.append({"role": "assistant", "content": m.content})
+            continue
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        if nxt is not None and nxt.role == "assistant" and (nxt.status or "complete") != "complete":
+            continue
+        out.append({"role": "user", "content": m.content})
+    return out
+
+
+# ── Chat ─────────────────────────────────────────────────────────────────────
 
 @chat_bp.route("/chat", methods=["POST"])
 @require_auth
 def chat():
     """
-    POST /api/chat — stream a chat response.
-    Body: {conversation_id, message, provider, model, use_repo, mode}
+    Body: {conversation_id, message, provider, model, use_repo, workspace_id,
+           mode ("quick"|"deep"), request_id, retry}
     """
     body = request.get_json(force=True, silent=True) or {}
     user = g.current_user
@@ -28,314 +160,214 @@ def chat():
     message_text = (body.get("message") or "").strip()
     if not message_text:
         return jsonify({"error": "message is required"}), 400
+    if len(message_text) > 100_000:
+        return jsonify({"error": "message is too long (100,000 characters max)"}), 400
 
-    conv_id = body.get("conversation_id")
-    provider_name = (body.get("provider") or cfg.get("DEFAULT_PROVIDER", "openai")).lower()
+    req_id = (body.get("request_id") or request.headers.get("X-Request-ID") or str(uuid.uuid4()))[:64]
+    with _runs_lock:
+        if req_id in _runs:
+            return jsonify({"error": "request_id already in use"}), 409
+
+    limit = _check_limits(user.id, cfg)
+    if limit:
+        return jsonify({"error": limit[0], "kind": "rate_limited"}), limit[1]
+
+    provider_name = (body.get("provider") or cfg.get("DEFAULT_PROVIDER", "gemini")).lower()
     model = body.get("model") or None
     use_repo = bool(body.get("use_repo", True))
-    mode = body.get("mode", "quick")  # quick | deep
+    depth = "deep" if body.get("mode") == "deep" else "quick"
+    retry = bool(body.get("retry"))
 
-    # Load or create conversation
+    try:
+        provider = ProviderFactory.get(provider_name, model)
+    except ProviderNotAvailableError as e:
+        return jsonify({"error": str(e), "kind": "provider_unavailable"}), 400
+
+    # Conversation
+    conv_id = body.get("conversation_id")
     if conv_id:
         conv = Conversation.query.filter_by(id=conv_id, user_id=user.id).first()
         if not conv:
             return jsonify({"error": "Conversation not found"}), 404
     else:
-        conv = Conversation(
-            user_id=user.id,
-            title=message_text[:80],
-            provider=provider_name,
-            model=model,
-        )
+        conv = Conversation(user_id=user.id, title=message_text[:80], provider=provider_name, model=model)
         db.session.add(conv)
-        db.session.flush()  # get ID
+        db.session.flush()
 
-    # Load workspace if conv has one
+    # Workspace (must belong to this user)
     workspace = None
-    repo_path = None
-    workspace_id = body.get("workspace_id") or (conv.workspace_id if conv else None)
-    if workspace_id:
-        workspace = Workspace.query.filter_by(id=workspace_id, user_id=user.id).first()
-        if workspace:
-            repo_path = workspace.repo_path
-            if not conv.workspace_id:
-                conv.workspace_id = workspace.id
+    ws_id = body.get("workspace_id") or conv.workspace_id
+    if ws_id:
+        workspace = Workspace.query.filter_by(id=ws_id, user_id=user.id).first()
+        if not workspace:
+            db.session.rollback()
+            return jsonify({"error": "Workspace not found"}), 404
+        if not conv.workspace_id:
+            conv.workspace_id = workspace.id
+    conv.provider, conv.model = provider_name, provider.model
 
-    # Persist user message
-    user_msg = Message(
-        conversation_id=conv.id,
-        role="user",
-        content=message_text,
-    )
-    db.session.add(user_msg)
-
-    # Detect intent + gather repo context
-    intent = detect_intent(message_text)
-    repo_context = ""
-    if use_repo and workspace and repo_path and intent in ("repository", "modification"):
-        try:
-            matches = searcher.search(workspace_id, repo_path, message_text, top_k=6, cfg=cfg)
-            if matches:
-                blocks = [
-                    f"### {m['file']} (lines {m['start_line']}-{m['end_line']}, "
-                    f"relevance {m['score']:.2f})\n```\n{m['text']}\n```"
-                    for m in matches
-                ]
-                repo_context = "\n\n".join(blocks)
-        except Exception:
-            pass
-
-    # Build messages from history
-    history = []
-    if conv.messages:
-        for msg in conv.messages[:-1]:  # exclude the just-added user message
-            if msg.role in ("user", "assistant") and msg.content:
-                history.append({"role": msg.role, "content": msg.content})
-
-    history.append({"role": "user", "content": message_text})
-
-    system_prompt = build_system_prompt(
-        BASE_SYSTEM_PROMPT,
-        repo_context=repo_context,
-        workspace_name=workspace.name if workspace else "",
-        intent=intent,
-    )
-
-    history = build_context(history, system_prompt, repo_context, max_tokens=100_000)
-
-    # Get LLM provider
+    # History before this turn; on retry, drop the failed reply and reuse the user turn
+    prior = list(conv.messages)
+    if retry and prior and prior[-1].role == "assistant" and (prior[-1].status or "complete") != "complete":
+        db.session.delete(prior[-1])
+        prior = prior[:-1]
+    if retry and prior and prior[-1].role == "user" and prior[-1].content == message_text:
+        prior = prior[:-1]
+    else:
+        db.session.add(Message(conversation_id=conv.id, role="user", content=message_text))
+    history = _completed_turns(prior)
     try:
-        provider = ProviderFactory.get(provider_name, model)
-    except ProviderNotAvailableError as e:
-        db.session.rollback()
-        return jsonify({
-            "error": str(e),
-            "hint": f"Configure your {provider_name.upper()}_API_KEY in settings or choose another provider.",
-        }), 400
-
-    model_info = provider.get_model_info()
-
-    def generate():
-        full_response = []
-        activity = [
-            {"status": "done", "text": "Understanding your request"},
-        ]
-
-        if repo_context:
-            activity.append({"status": "done", "text": f"Found relevant code in your repository"})
-
-        # Yield activity log first as a JSON event
-        yield f"data: {json.dumps({'type': 'activity', 'items': activity})}\n\n"
-
-        # Stream the actual response
-        yield f"data: {json.dumps({'type': 'start'})}\n\n"
-
-        for chunk in provider.stream(history, system_prompt=system_prompt):
-            full_response.append(chunk)
-            yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
-
-        full_text = "".join(full_response)
-        input_tokens = sum(len(m.get("content", "")) // 4 for m in history)
-        output_tokens = len(full_text) // 4
-
-        # Persist assistant message
-        assistant_msg = Message(
-            conversation_id=conv.id,
-            role="assistant",
-            content=full_text,
-            provider=provider_name,
-            model=model_info.model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            activity_log=activity,
-        )
-        db.session.add(assistant_msg)
-
-        # Track usage
-        UsageRecord.record(
-            user_id=user.id,
-            provider=provider_name,
-            model=model_info.model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            conversation_id=conv.id,
-        )
-
         db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        logger.error("[chat] DB commit failed: %s", exc)
+        return jsonify({"error": "Database error"}), 500
 
-        yield f"data: {json.dumps({'type': 'done', 'conversation_id': conv.id, 'message_id': assistant_msg.id})}\n\n"
+    ws_ref = None
+    if workspace and use_repo:
+        ws_ref = WorkspaceRef(workspace.id, workspace.name, workspace.repo_path, workspace.branch or "")
+    elif workspace and not use_repo:
+        ws_ref = None
+
+    cancel_ev = _register_request(req_id, user.id)
+    agent = AgentRun(message=message_text, history=history, provider=provider, workspace=ws_ref,
+                     cfg=dict(cfg), cancel_event=cancel_ev, request_id=req_id, depth=depth)
+    conv_id, user_id, ws_db_id = conv.id, user.id, workspace.id if workspace else None
+    logger.info("[chat] req=%s user=%s conv=%s provider=%s model=%s ws=%s", req_id, user_id, conv_id,
+                provider_name, provider.model, ws_db_id)
+
+    def generate() -> Iterator[str]:
+        started = time.monotonic()
+        text_parts: list[str] = []
+        outcome = "error"
+        err: AgentError | None = None
+        try:
+            yield _sse({"type": "start", "request_id": req_id, "conversation_id": conv_id,
+                        "provider": provider_name, "model": provider.model})
+            for ev in agent.run():
+                t = ev.get("type")
+                if t == "heartbeat":
+                    yield ": ping\n\n"
+                    continue
+                if t == "chunk":
+                    text_parts.append(ev["content"])
+                ev["request_id"] = req_id
+                yield _sse(ev)
+            outcome = "complete"
+            record_provider_result(provider_name, None, provider.model)
+        except AgentCancelled:
+            outcome = "cancelled"
+        except AgentError as e:
+            err = e
+            if e.kind.startswith("provider_"):
+                from app.llm.base import ProviderError
+                record_provider_result(provider_name, ProviderError(provider_name, e.kind[9:], e.message),
+                                       provider.model)
+            logger.warning("[chat] req=%s failed kind=%s: %s", req_id, e.kind, e.message)
+        except GeneratorExit:
+            cancel_ev.set()  # client went away: stop the provider request
+            outcome = "cancelled"
+            raise
+        except Exception as e:  # never leave the client hanging
+            logger.exception("[chat] req=%s unexpected error", req_id)
+            err = AgentError("internal", f"Unexpected server error: {type(e).__name__}: {e}")
+        finally:
+            _unregister_request(req_id)
+            final = _persist(outcome, err, agent, text_parts, started)
+            logger.info("[chat] req=%s outcome=%s total_ms=%s timings=%s", req_id, outcome,
+                        final.get("metrics", {}).get("total_ms"), agent.result.timings)
+
+        if outcome == "complete":
+            if final.get("change"):
+                yield _sse({"type": "proposal", "change": final["change"], "request_id": req_id})
+            if final.get("command"):
+                yield _sse({"type": "command", "command": final["command"], "request_id": req_id})
+            yield _sse({"type": "done", "conversation_id": conv_id, "message_id": final.get("message_id"),
+                        "metrics": final.get("metrics"), "request_id": req_id})
+        elif outcome == "cancelled":
+            yield _sse({"type": "cancelled", "message_id": final.get("message_id"), "request_id": req_id})
+        else:
+            yield _sse({"type": "error", "message": err.message if err else "Request failed",
+                        "kind": err.kind if err else "internal",
+                        "retryable": err.retryable if err else True,
+                        "message_id": final.get("message_id"), "request_id": req_id})
+
+    def _persist(outcome: str, err, agent: AgentRun, text_parts: list[str], started: float) -> dict:
+        """Save the assistant turn, proposal/command, and usage. Never raises."""
+        res = agent.result
+        total_ms = int((time.monotonic() - started) * 1000)
+        metrics = {
+            "total_ms": total_ms, "ttft_ms": res.ttft_ms, "timings": res.timings,
+            "input_tokens": res.usage.input_tokens, "output_tokens": res.usage.output_tokens,
+            "tokens_estimated": res.usage.estimated, "provider": provider_name, "model": provider.model,
+            "llm_calls": res.llm_calls,
+        }
+        out: dict = {"metrics": metrics}
+        try:
+            if outcome == "complete":
+                content = res.content
+            elif outcome == "cancelled":
+                partial = "".join(text_parts) if res.mode == "answer" else ""
+                content = (partial + "\n\n" if partial else "") + "_Stopped by user._"
+            else:
+                content = f"**Request failed:** {err.message if err else 'unknown error'}"
+            from app.models.usage import estimate_cost
+            metrics["cost_usd"] = round(estimate_cost(provider_name, provider.model,
+                                                      res.usage.input_tokens, res.usage.output_tokens), 6)
+            msg = Message(
+                conversation_id=conv_id, role="assistant", content=content, status=outcome,
+                provider=provider_name, model=provider.model,
+                input_tokens=res.usage.input_tokens, output_tokens=res.usage.output_tokens,
+                activity_log=agent.activity,
+                meta={"mode": res.mode, "scope": res.scope, "files_read": res.files_read,
+                      "request_id": req_id, "metrics": metrics,
+                      "error": ({"kind": err.kind, "message": err.message, "retryable": err.retryable}
+                                if err else None)},
+            )
+            db.session.add(msg)
+            db.session.flush()
+            out["message_id"] = msg.id
+
+            if outcome == "complete" and res.changes and ws_db_id:
+                change = ProposedChange(
+                    user_id=user_id, workspace_id=ws_db_id, conversation_id=conv_id, message_id=msg.id,
+                    request_id=req_id, status="pending", summary=res.summary, plan=res.plan_steps,
+                    git_branch=agent.workspace.branch if agent.workspace else None,
+                    files=[{"path": c.path, "action": c.action, "original": c.original, "new": c.new,
+                            "original_hash": res.file_hashes.get(c.path) if c.action != "create" else None,
+                            "diff": c.diff, "additions": c.additions, "deletions": c.deletions,
+                            "warnings": c.warnings} for c in res.changes],
+                )
+                db.session.add(change)
+                db.session.flush()
+                out["change"] = change.to_dict()
+            if outcome == "complete" and res.command and ws_db_id:
+                appr = PendingApproval(
+                    conversation_id=conv_id, user_id=user_id, workspace_id=ws_db_id, message_id=msg.id,
+                    tool_name="run_command", tool_args={"command": res.command["command"]},
+                    reason=res.command.get("reason"), danger_level=res.command["danger_level"],
+                    status="pending",
+                )
+                db.session.add(appr)
+                db.session.flush()
+                out["command"] = {**appr.to_dict(), "risk_reason": res.command.get("risk_reason")}
+
+            if res.llm_calls or outcome == "complete":
+                UsageRecord.record(user_id=user_id, provider=provider_name, model=provider.model,
+                                   input_tokens=res.usage.input_tokens, output_tokens=res.usage.output_tokens,
+                                   conversation_id=conv_id, request_id=req_id, duration_ms=total_ms,
+                                   status=outcome, estimated=res.usage.estimated)
+            c = db.session.get(Conversation, conv_id)
+            if c:
+                c.updated_at = datetime.now(timezone.utc)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("[chat] req=%s failed to persist results", req_id)
+        return out
 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": req_id},
     )
-
-
-@chat_bp.route("/propose_edit", methods=["POST"])
-@require_auth
-def propose_edit():
-    """
-    POST /api/propose_edit — ask AI to propose a file edit.
-    Body: {workspace_id, path, instruction, provider, model}
-    """
-    body = request.get_json(force=True, silent=True) or {}
-    user = g.current_user
-    cfg = current_app.config
-
-    workspace_id = body.get("workspace_id")
-    path = (body.get("path") or "").strip()
-    instruction = (body.get("instruction") or "").strip()
-    provider_name = (body.get("provider") or cfg.get("DEFAULT_PROVIDER", "openai")).lower()
-    model = body.get("model") or None
-
-    if not workspace_id or not path or not instruction:
-        return jsonify({"error": "workspace_id, path and instruction are required"}), 400
-
-    workspace = Workspace.query.filter_by(id=workspace_id, user_id=user.id).first()
-    if not workspace:
-        return jsonify({"error": "Workspace not found"}), 404
-
-    content = searcher.read_file(workspace.repo_path, path)
-    if content is None:
-        return jsonify({"error": f"Cannot read file: {path}"}), 400
-
-    from app.agent.planner import EDIT_SYSTEM_PROMPT
-    from app.agent.executor import compute_diff
-
-    messages = [{"role": "user", "content":
-                 f"File path: {path}\n\nCurrent file content:\n{content}\n\n"
-                 f"Instruction: {instruction}"}]
-
-    try:
-        provider = ProviderFactory.get(provider_name, model)
-    except ProviderNotAvailableError as e:
-        return jsonify({"error": str(e)}), 400
-
-    raw_response = "".join(provider.stream(messages, system_prompt=EDIT_SYSTEM_PROMPT))
-    explanation, proposed = parse_file_response(raw_response)
-
-    if proposed is None:
-        return jsonify({"error": "AI could not generate a valid edit",
-                        "raw_response": raw_response[:500]}), 502
-
-    # Normalize trailing newline
-    if content.endswith("\n") and not proposed.endswith("\n"):
-        proposed += "\n"
-    elif not content.endswith("\n") and proposed.endswith("\n"):
-        proposed = proposed.rstrip("\n")
-
-    diff = compute_diff(content, proposed, path)
-    return jsonify({
-        "path": path,
-        "original_content": content,
-        "proposed_content": proposed,
-        "explanation": explanation,
-        "diff": diff,
-        "unchanged": proposed == content,
-    })
-
-
-@chat_bp.route("/apply_edit", methods=["POST"])
-@require_auth
-def apply_edit():
-    """POST /api/apply_edit — apply an approved file edit."""
-    body = request.get_json(force=True, silent=True) or {}
-    user = g.current_user
-
-    workspace_id = body.get("workspace_id")
-    path = (body.get("path") or "").strip()
-    content = body.get("content")
-
-    if not workspace_id or not path or content is None:
-        return jsonify({"error": "workspace_id, path, content are required"}), 400
-
-    workspace = Workspace.query.filter_by(id=workspace_id, user_id=user.id).first()
-    if not workspace:
-        return jsonify({"error": "Workspace not found"}), 404
-
-    from app.agent.executor import apply_file_edit
-    result = apply_file_edit(workspace.repo_path, path, content)
-    if not result["ok"]:
-        return jsonify({"error": result["error"]}), 500
-    return jsonify(result)
-
-
-@chat_bp.route("/diagnose", methods=["POST"])
-@require_auth
-def diagnose():
-    """POST /api/diagnose — AI bug diagnosis and fix."""
-    body = request.get_json(force=True, silent=True) or {}
-    user = g.current_user
-    cfg = current_app.config
-
-    workspace_id = body.get("workspace_id")
-    problem = (body.get("problem") or "").strip()
-    provider_name = (body.get("provider") or cfg.get("DEFAULT_PROVIDER", "openai")).lower()
-    model = body.get("model") or None
-
-    if not workspace_id or not problem:
-        return jsonify({"error": "workspace_id and problem are required"}), 400
-
-    workspace = Workspace.query.filter_by(id=workspace_id, user_id=user.id).first()
-    if not workspace:
-        return jsonify({"error": "Workspace not found"}), 404
-
-    matches = searcher.search(workspace_id, workspace.repo_path, problem, top_k=8, cfg=cfg)
-    if not matches:
-        return jsonify({"error": "No relevant code found in the indexed repository"}), 404
-
-    primary_file = matches[0]["file"]
-    content = searcher.read_file(workspace.repo_path, primary_file)
-    if content is None:
-        return jsonify({"error": f"Cannot read primary suspect file: {primary_file}"}), 500
-
-    context_blocks = []
-    seen = set()
-    for m in matches[1:]:
-        if m["file"] not in seen:
-            seen.add(m["file"])
-            context_blocks.append(
-                f"### {m['file']} (lines {m['start_line']}-{m['end_line']})\n```\n{m['text']}\n```"
-            )
-        if len(seen) >= 3:
-            break
-
-    user_content = (
-        f"Problem description:\n{problem}\n\n"
-        f"Most likely responsible file: {primary_file}\n\n"
-        f"Full current content of {primary_file}:\n{content}\n"
-    )
-    if context_blocks:
-        user_content += "\n\nOther related code:\n\n" + "\n\n".join(context_blocks)
-
-    from app.agent.planner import DIAGNOSE_SYSTEM_PROMPT
-    from app.agent.executor import compute_diff
-
-    try:
-        provider = ProviderFactory.get(provider_name, model)
-    except ProviderNotAvailableError as e:
-        return jsonify({"error": str(e)}), 400
-
-    raw = "".join(provider.stream([{"role": "user", "content": user_content}],
-                                   system_prompt=DIAGNOSE_SYSTEM_PROMPT))
-    explanation, proposed = parse_file_response(raw)
-    if proposed is None:
-        return jsonify({"error": "AI could not generate a fix", "raw_response": raw[:500]}), 502
-
-    if content.endswith("\n") and not proposed.endswith("\n"):
-        proposed += "\n"
-
-    diff = compute_diff(content, proposed, primary_file)
-    return jsonify({
-        "path": primary_file,
-        "explanation": explanation,
-        "original_content": content,
-        "proposed_content": proposed,
-        "diff": diff,
-        "unchanged": proposed == content,
-        "other_candidates": [m["file"] for m in matches[1:] if m["file"] != primary_file][:3],
-    })

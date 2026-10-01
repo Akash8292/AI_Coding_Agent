@@ -1,242 +1,172 @@
 """
-Agent tool executor.
-Handles permission checking, sandboxing, and actual execution.
+Applying reviewed changes to the workspace.
+
+apply_change_set() is the only code path that writes agent edits to disk:
+  1. Pre-check EVERY file: its current bytes must hash to what the proposal was
+     computed from (modify/delete), or it must not exist (create). If the user
+     changed a file after the proposal, nothing is written — status "stale".
+  2. Optional git checkpoint (non-destructive snapshot) before writing.
+  3. Atomic write of each file, preserving newline style and BOM.
+  4. If any write fails, already-written files are restored (all-or-nothing).
+  5. Verification: re-read each file and confirm it matches the reviewed
+     content, then syntax-check languages we can check.
+
+revert_change_set() undoes an applied change the same way, and refuses to
+touch a file the user has edited since it was applied.
 """
-import difflib
 import os
-import subprocess
-from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
-from app.agent.tools import TOOLS, DANGER_SAFE, DANGER_MODERATE, DANGER_DANGEROUS, get_tool
-from app.repository import searcher, git_tools
-from app.repository.indexer import list_files as index_list_files
-
-# Permission modes
-PERM_ASK_ALWAYS = "ask_always"
-PERM_ASK_DANGEROUS = "ask_dangerous"   # default: safe/moderate auto-approve
-PERM_MANUAL_ONLY = "manual_only"        # everything needs approval
+from app.agent.editor import syntax_error
+from app.repository import workspace_fs, git_tools
 
 
-def _is_within(path: str, root: str) -> bool:
-    path = os.path.realpath(path)
-    root = os.path.realpath(root)
+class StaleChangeError(Exception):
+    def __init__(self, paths: list[str]):
+        super().__init__("Files changed since the proposal was made: " + ", ".join(paths))
+        self.paths = paths
+
+
+def _current(root: str, path: str) -> Optional[bytes]:
+    return workspace_fs.read_raw(root, path)
+
+
+def apply_change_set(root: str, files: list[dict], checkpoint: bool = True,
+                     label: str = "before applying change") -> dict:
+    """
+    files: [{path, action, original, new, original_hash}]
+    Returns {ok, checkpoint, verification:[{path, ok, message}], written:[paths]}.
+    Raises StaleChangeError (nothing written) or OSError/WorkspacePathError.
+    """
+    stale = []
+    snapshots: dict[str, Optional[bytes]] = {}
+    for f in files:
+        path = f["path"]
+        workspace_fs.resolve(root, path, for_write=True)  # validates path policy
+        raw = _current(root, path)
+        snapshots[path] = raw
+        if f["action"] == "create":
+            if raw is not None:
+                stale.append(path)
+        elif workspace_fs.sha256_bytes(raw) != f.get("original_hash"):
+            stale.append(path)
+    if stale:
+        raise StaleChangeError(stale)
+
+    cp = None
+    if checkpoint and git_tools.is_git_repo(root):
+        res = git_tools.create_checkpoint(root, label)
+        cp = res.get("sha") if res.get("ok") else None
+
+    written: list[str] = []
     try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
-        return False
+        for f in files:
+            path = f["path"]
+            if f["action"] == "delete":
+                workspace_fs.delete_file(root, path)
+            else:
+                workspace_fs.write_atomic(root, path, workspace_fs.encode_like(f["new"], snapshots[path]))
+            written.append(path)
+    except Exception:
+        _restore(root, written, snapshots)
+        raise
+
+    return {"ok": True, "checkpoint": cp, "written": written,
+            "verification": verify(root, files, snapshots)}
 
 
-def needs_approval(tool_name: str, permission_mode: str) -> bool:
-    """Return True if this tool requires explicit user approval."""
-    tool = get_tool(tool_name)
-    if not tool:
-        return True  # unknown tools always need approval
+def verify(root: str, files: list[dict], snapshots: dict) -> list[dict]:
+    results = []
+    for f in files:
+        path = f["path"]
+        raw = _current(root, path)
+        if f["action"] == "delete":
+            ok = raw is None
+            results.append({"path": path, "ok": ok, "check": "deleted",
+                            "message": "File removed" if ok else "File still exists"})
+            continue
+        expected = workspace_fs.encode_like(f["new"], snapshots.get(path))
+        if raw != expected:
+            results.append({"path": path, "ok": False, "check": "content",
+                            "message": "File on disk does not match the reviewed content"})
+            continue
+        err = syntax_error(path, f["new"])
+        if err:
+            results.append({"path": path, "ok": False, "check": "syntax", "message": f"Syntax error: {err}"})
+        else:
+            checked = os.path.splitext(path)[1].lower() in (".py", ".json", ".toml", ".js", ".mjs",
+                                                             ".cjs", ".yml", ".yaml")
+            results.append({"path": path, "ok": True, "check": "syntax" if checked else "content",
+                            "message": "Written; syntax OK" if checked else "Written and verified"})
+    return results
 
-    if permission_mode == PERM_MANUAL_ONLY:
-        return True
-    elif permission_mode == PERM_ASK_ALWAYS:
-        return True
-    elif permission_mode == PERM_ASK_DANGEROUS:
-        # Only moderate and dangerous need approval
-        return tool.danger_level in (DANGER_MODERATE, DANGER_DANGEROUS)
-    return True
+
+def _restore(root: str, paths: list[str], snapshots: dict) -> None:
+    for path in reversed(paths):
+        raw = snapshots.get(path)
+        try:
+            if raw is None:
+                workspace_fs.delete_file(root, path)
+            else:
+                workspace_fs.write_atomic(root, path, raw)
+        except Exception:
+            pass
 
 
-def execute_tool(tool_name: str, args: dict, workspace_id: int,
-                 repo_path: str, cfg: dict = None) -> dict:
+def revert_change_set(root: str, files: list[dict]) -> dict:
     """
-    Execute a tool and return its result.
-    Returns {ok, result, error, activity}
+    Undo an applied change. Each file must still contain exactly what was
+    written; otherwise nothing is reverted (StaleChangeError).
     """
-    cfg = cfg or {}
+    stale = []
+    snapshots = {}
+    for f in files:
+        path = f["path"]
+        raw = _current(root, path)
+        snapshots[path] = raw
+        if f["action"] == "delete":
+            if raw is not None:
+                stale.append(path)
+        elif raw is None or workspace_fs.to_logical(raw.decode("utf-8-sig", errors="replace")) != f["new"]:
+            stale.append(path)
+    if stale:
+        raise StaleChangeError(stale)
 
-    if tool_name == "list_files":
-        files = index_list_files(workspace_id, repo_path, cfg)
-        return {
-            "ok": True,
-            "result": files,
-            "activity": f"Listed {len(files)} files in repository",
-        }
-
-    elif tool_name == "search_code":
-        query = args.get("query", "")
-        top_k = args.get("top_k", 6)
-        results = searcher.search(workspace_id, repo_path, query, top_k=top_k, cfg=cfg)
-        return {
-            "ok": True,
-            "result": results,
-            "activity": f"Found {len(results)} relevant code sections for: {query[:50]}",
-        }
-
-    elif tool_name == "read_file":
-        path = args.get("path", "")
-        abs_path = os.path.join(repo_path, path)
-        if not _is_within(abs_path, repo_path):
-            return {"ok": False, "error": "Path escapes repository boundary", "activity": f"Blocked: {path}"}
-
-        content = searcher.read_file(repo_path, path)
-        if content is None:
-            return {"ok": False, "error": f"Cannot read file: {path}", "activity": f"Failed to read: {path}"}
-
-        start = args.get("start_line")
-        end = args.get("end_line")
-        if start or end:
-            lines = content.splitlines()
-            s = (start or 1) - 1
-            e = end or len(lines)
-            content = "\n".join(lines[s:e])
-
-        return {
-            "ok": True,
-            "result": {"path": path, "content": content},
-            "activity": f"Read file: {path}",
-        }
-
-    elif tool_name == "git_status":
-        result = git_tools.git_status(repo_path)
-        return {"ok": result["ok"], "result": result["stdout"], "activity": "Checked git status"}
-
-    elif tool_name == "git_diff":
-        result = git_tools.git_diff(repo_path, args.get("path"))
-        return {"ok": result["ok"], "result": result["stdout"], "activity": "Checked git diff"}
-
-    elif tool_name == "git_log":
-        result = git_tools.git_log(repo_path, args.get("n", 10))
-        return {"ok": result["ok"], "result": result["stdout"], "activity": "Read git log"}
-
-    elif tool_name == "edit_file":
-        # Returns a pending diff — not applied yet, goes through user review
-        path = args.get("path", "")
-        instruction = args.get("instruction", "")
-        abs_path = os.path.join(repo_path, path)
-        if not _is_within(abs_path, repo_path):
-            return {"ok": False, "error": "Path escapes repository boundary"}
-        if not os.path.isfile(abs_path):
-            return {"ok": False, "error": f"File not found: {path}"}
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                original = f.read()
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-        return {
-            "ok": True,
-            "result": {"path": path, "original": original, "instruction": instruction,
-                       "status": "pending_edit"},
-            "activity": f"Prepared edit for: {path}",
-        }
-
-    elif tool_name == "create_file":
-        path = args.get("path", "")
-        content = args.get("content", "")
-        abs_path = os.path.join(repo_path, path)
-        if not _is_within(abs_path, repo_path):
-            return {"ok": False, "error": "Path escapes repository boundary"}
-        try:
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return {"ok": True, "result": {"path": path}, "activity": f"Created file: {path}"}
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-
-    elif tool_name == "delete_file":
-        path = args.get("path", "")
-        abs_path = os.path.join(repo_path, path)
-        if not _is_within(abs_path, repo_path):
-            return {"ok": False, "error": "Path escapes repository boundary"}
-        try:
-            # Backup before delete
-            backup = abs_path + ".bak"
-            with open(abs_path, "r", encoding="utf-8") as f:
-                with open(backup, "w", encoding="utf-8") as b:
-                    b.write(f.read())
-            os.remove(abs_path)
-            return {"ok": True, "result": {"path": path, "backup": backup},
-                    "activity": f"Deleted file: {path} (backup: {backup})"}
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-
-    elif tool_name == "run_command":
-        command = args.get("command", "").strip()
-        timeout = cfg.get("COMMAND_TIMEOUT_SECONDS", 30)
-        max_output = cfg.get("COMMAND_MAX_OUTPUT_BYTES", 50_000)
-
-        if not command:
-            return {"ok": False, "error": "Empty command"}
-
-        try:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            out = (proc.stdout + proc.stderr)[:max_output]
-            return {
-                "ok": proc.returncode == 0,
-                "result": {
-                    "command": command,
-                    "exit_code": proc.returncode,
-                    "output": out,
-                },
-                "activity": f"Ran command: {command[:60]} (exit {proc.returncode})",
-            }
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"Command timed out after {timeout}s",
-                    "activity": f"Command timed out: {command[:60]}"}
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
-
-    elif tool_name == "run_tests":
-        command = args.get("command", "pytest -q")
-        return execute_tool("run_command", {"command": command, "reason": "running tests"},
-                            workspace_id, repo_path, cfg)
-
-    return {"ok": False, "error": f"Unknown tool: {tool_name}"}
+    written = []
+    try:
+        for f in files:
+            path = f["path"]
+            if f["action"] == "create":
+                workspace_fs.delete_file(root, path)
+            else:
+                workspace_fs.write_atomic(root, path, workspace_fs.encode_like(f["original"], snapshots[path]))
+            written.append(path)
+    except Exception:
+        _restore(root, written, snapshots)
+        raise
+    return {"ok": True, "reverted": written}
 
 
 def apply_file_edit(repo_path: str, path: str, proposed_content: str) -> dict:
-    """Write proposed content to disk after user approval. Creates .bak backup."""
-    abs_path = os.path.join(repo_path, path)
-    if not _is_within(abs_path, repo_path):
-        return {"ok": False, "error": "Path escapes repository boundary"}
-    if not os.path.isfile(abs_path):
-        return {"ok": False, "error": f"File not found: {path}"}
+    """Single-file write with the same safety rules (legacy helper)."""
     try:
-        with open(abs_path, "r", encoding="utf-8") as f:
-            original = f.read()
-        with open(abs_path + ".bak", "w", encoding="utf-8") as f:
-            f.write(original)
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(proposed_content)
-        return {"ok": True, "path": path, "backup": path + ".bak"}
-    except OSError as e:
+        raw = _current(repo_path, path)
+        if raw is None:
+            return {"ok": False, "error": f"File not found: {path}"}
+        f = {"path": path, "action": "modify", "new": workspace_fs.to_logical(proposed_content),
+             "original_hash": workspace_fs.sha256_bytes(raw)}
+        res = apply_change_set(repo_path, [f], checkpoint=False)
+        return {"ok": True, "path": path, "verification": res["verification"]}
+    except workspace_fs.WorkspacePathError as e:
+        return {"ok": False, "error": f"Path escapes repository boundary or is protected: {e}"}
+    except (OSError, StaleChangeError) as e:
         return {"ok": False, "error": str(e)}
 
 
 def compute_diff(original: str, proposed: str, path: str) -> list[dict]:
-    """Return structured diff lines."""
-    diff_lines = difflib.unified_diff(
-        original.splitlines(keepends=True),
-        proposed.splitlines(keepends=True),
-        fromfile=f"{path} (current)",
-        tofile=f"{path} (proposed)",
-        n=3,
-    )
-    result = []
-    for line in diff_lines:
-        if line.startswith("+++") or line.startswith("---"):
-            kind = "header"
-        elif line.startswith("@@"):
-            kind = "hunk"
-        elif line.startswith("+"):
-            kind = "add"
-        elif line.startswith("-"):
-            kind = "remove"
-        else:
-            kind = "context"
-        result.append({"type": kind, "text": line.rstrip("\n")})
-    return result
+    from app.agent.editor import compute_diff as _cd
+    return _cd(original, proposed, path)
+
+
+def _is_within(path: str, root: str) -> bool:
+    return git_tools._is_within(path, root)

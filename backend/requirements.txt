@@ -8,3 +8,5 @@ requests==2.32.3
 numpy>=1.26.4,<3
 gunicorn==22.0.0
 python-dotenv==1.0.1
+psycopg2-binary>=2.9.9     # only needed when DATABASE_URL points to PostgreSQL
+PyYAML>=6.0                # optional: YAML syntax validation of edits

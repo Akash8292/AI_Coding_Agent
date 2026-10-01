@@ -1,8 +1,10 @@
 """
 Kimi (Moonshot) provider — OpenAI-compatible API.
 """
+from typing import Optional
+
 from app.llm.openai_provider import OpenAIProvider
-from app.llm.base import ModelInfo, ProviderNotAvailableError
+from app.llm.base import ModelInfo, Timeouts
 
 KIMI_MODELS = {
     "kimi-k2.7-code": {"context": 128_000, "max_out": 16_384},
@@ -16,11 +18,15 @@ KIMI_MODELS = {
 
 class KimiProvider(OpenAIProvider):
     """Kimi (Moonshot AI) — uses OpenAI-compatible Chat Completions API."""
+    supports_stream_usage = False  # Moonshot reports usage inside choices, not via stream_options
+    max_tokens_param = "max_tokens"
 
     def __init__(self, api_key: str, model: str = "kimi-k2.7-code",
-                 base_url: str = "https://api.moonshot.ai/v1"):
+                 base_url: str = "https://api.moonshot.ai/v1",
+                 timeouts: Optional[Timeouts] = None):
         super().__init__(api_key=api_key, model=model, base_url=base_url,
-                         provider_name_override="kimi", label_override="Kimi (Moonshot)")
+                         provider_name_override="kimi", label_override="Kimi (Moonshot)",
+                         timeouts=timeouts)
 
     def get_model_info(self) -> ModelInfo:
         info = KIMI_MODELS.get(self._model, {"context": 8_192, "max_out": 4_096})

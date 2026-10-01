@@ -13,6 +13,7 @@ COST_PER_MILLION = {
     },
     "anthropic": {
         "claude-sonnet-5": {"input": 3.00, "output": 15.00},
+        "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
         "claude-opus-4-8": {"input": 15.00, "output": 75.00},
         "claude-3-7-sonnet": {"input": 3.00, "output": 15.00},
         "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
@@ -36,6 +37,7 @@ COST_PER_MILLION = {
 
 
 def estimate_cost(provider: str, model: str, input_tokens: int, output_tokens: int) -> float:
+    """Approximate USD cost from the price table above (0 for unknown providers)."""
     provider_costs = COST_PER_MILLION.get(provider, {})
     model_costs = provider_costs.get(model, provider_costs.get("default", {"input": 0, "output": 0}))
     return (input_tokens * model_costs["input"] + output_tokens * model_costs["output"]) / 1_000_000
@@ -52,6 +54,10 @@ class UsageRecord(db.Model):
     input_tokens = db.Column(db.Integer, default=0)
     output_tokens = db.Column(db.Integer, default=0)
     cost_usd = db.Column(db.Float, default=0.0)
+    request_id = db.Column(db.String(64), nullable=True)
+    duration_ms = db.Column(db.Integer, nullable=True)
+    status = db.Column(db.String(20), nullable=True)        # complete | error | cancelled
+    estimated = db.Column(db.Boolean, nullable=True)        # True when tokens were estimated
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     # Relationship
@@ -60,7 +66,9 @@ class UsageRecord(db.Model):
     @classmethod
     def record(cls, user_id: int, provider: str, model: str,
                input_tokens: int, output_tokens: int,
-               conversation_id: int = None) -> "UsageRecord":
+               conversation_id: int = None, request_id: str = None,
+               duration_ms: int = None, status: str = "complete",
+               estimated: bool = None) -> "UsageRecord":
         cost = estimate_cost(provider, model, input_tokens, output_tokens)
         record = cls(
             user_id=user_id,
@@ -70,6 +78,10 @@ class UsageRecord(db.Model):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost,
+            request_id=request_id,
+            duration_ms=duration_ms,
+            status=status,
+            estimated=estimated,
         )
         db.session.add(record)
         return record
@@ -82,5 +94,9 @@ class UsageRecord(db.Model):
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cost_usd": self.cost_usd,
+            "request_id": self.request_id,
+            "duration_ms": self.duration_ms,
+            "status": self.status,
+            "estimated": self.estimated,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

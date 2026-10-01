@@ -1,0 +1,25 @@
+# Never ship local state or secrets in the image
+.env
+.env.*
+!.env.example
+config.py
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/instance/
+**/index_cache/
+**/workspaces/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+venv/
+.venv/
+.git/
+.kilo/
+backend/test_out.txt
+# legacy v1 app (not part of the deployed service)
+app.py
+repo_index.py
+requirements.txt
+static/
+templates/

@@ -1,4 +1,18 @@
 __pycache__/
 *.pyc
-config.py
+.pytest_cache/
+
+# secrets
 .env
+config.py
+
+# local state (never commit)
+*.db
+*.db-shm
+*.db-wal
+instance/
+index_cache/
+workspaces/
+venv/
+.venv/
+backend/test_out.txt

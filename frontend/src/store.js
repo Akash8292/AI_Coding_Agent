@@ -3,6 +3,10 @@
  */
 
 const Store = (() => {
+  const saved = (() => {
+    try { return JSON.parse(localStorage.getItem('codesage_prefs') || '{}'); } catch (e) { return {}; }
+  })();
+
   const state = {
     user: null,
     workspaces: [],
@@ -11,10 +15,10 @@ const Store = (() => {
     activeConversationId: null,
     messages: [],
     models: {},
-    selectedProvider: 'openai',
-    selectedModel: 'gpt-4o',
-    mode: 'quick',
-    useRepo: true,
+    selectedProvider: saved.provider || 'gemini',
+    selectedModel: saved.model || '',
+    mode: saved.mode || 'quick',
+    useRepo: saved.useRepo !== undefined ? saved.useRepo : true,
     isStreaming: false,
     streamingContent: '',
     activityLog: [],
@@ -99,7 +103,9 @@ const Store = (() => {
 
     // Pick first available provider if current isn't valid or available
     if (models && (!models[provider] || !models[provider].available)) {
-      const availableProvider = Object.keys(models).find(k => models[k].available);
+      const keys = Object.keys(models);
+      const availableProvider = keys.find(k => models[k].available && models[k].status === 'ready')
+        || keys.find(k => models[k].available);
       if (availableProvider) {
         provider = availableProvider;
         model = models[provider].default_model || (models[provider].models && models[provider].models[0]);
@@ -115,23 +121,45 @@ const Store = (() => {
     });
   }
 
+  function savePrefs() {
+    try {
+      localStorage.setItem('codesage_prefs', JSON.stringify({
+        provider: state.selectedProvider, model: state.selectedModel, mode: state.mode, useRepo: state.useRepo,
+      }));
+    } catch (e) { /* storage unavailable — preferences just won't persist */ }
+  }
+
   function setModel(provider, model) {
     setState({
       selectedProvider: provider,
       selectedModel: model,
     });
+    savePrefs();
+  }
+
+  /** Replace a message's attached change/command record (after apply/reject/etc). */
+  function updateAttached(kind, record) {
+    for (const m of state.messages) {
+      if (m[kind] && m[kind].id === record.id) m[kind] = record;
+    }
   }
 
   function setMode(mode) {
     setState({ mode });
+    savePrefs();
   }
 
   function setUseRepo(useRepo) {
     setState({ useRepo });
+    savePrefs();
   }
 
-  function setStreaming(isStreaming, streamingContent = '') {
-    setState({ isStreaming, streamingContent });
+  function setStreaming(isStreaming, streamingContent = undefined) {
+    if (streamingContent !== undefined) {
+      setState({ isStreaming, streamingContent });
+    } else {
+      setState({ isStreaming });
+    }
   }
 
   function appendStreamingChunk(chunk) {
@@ -198,6 +226,7 @@ const Store = (() => {
     setPendingPermission,
     allowSessionPermission,
     hasSessionPermission,
+    updateAttached,
   };
 })();
 

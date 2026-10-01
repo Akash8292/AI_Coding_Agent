@@ -1,27 +1,63 @@
 /**
  * CodeSage Main Application Coordinator
+ *
+ * Chat lifecycle (agent state machine):
+ *   IDLE ──send──▶ RUNNING ──done/error/cancelled──▶ IDLE
+ *                     │
+ *                   Stop ──▶ STOPPING (server cancel + fetch abort) ──▶ IDLE
+ * After every run the conversation is re-fetched from the server, so what is
+ * rendered (messages, proposals, statuses) is exactly what was persisted.
  */
 
 (function () {
-  let pendingPermissionCallback = null;
+  // ── Rendering helpers ───────────────────────────────────────────────────
+  if (window.marked) window.marked.use({ async: false, breaks: true, gfm: true });
 
-  // Initialize markdown renderer if available
-  if (window.marked) {
-    window.marked.setOptions({
-      highlight: function (code, lang) {
-        if (window.hljs && lang && window.hljs.getLanguage(lang)) {
-          try {
-            return window.hljs.highlight(code, { language: lang }).value;
-          } catch (e) {}
-        }
-        return window.hljs ? window.hljs.highlightAuto(code).value : code;
-      },
-      breaks: true,
-      gfm: true,
+  function escapeHtml(str) {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+  }
+  window.escapeHtml = escapeHtml;
+
+  /** Markdown → sanitized HTML. LLM output is untrusted: never inject it raw. */
+  function renderMarkdown(text) {
+    if (!text) return '';
+    let html = null;
+    try {
+      if (window.marked) {
+        const out = window.marked.parse(text);
+        if (typeof out === 'string') html = out;
+      }
+    } catch (e) { /* fall through */ }
+    if (html === null || !window.DOMPurify) {
+      return `<pre class="plain-text">${escapeHtml(text)}</pre>`;
+    }
+    return window.DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  }
+
+  /** Syntax-highlight code blocks and add copy buttons inside `root`. */
+  function enhanceCode(root) {
+    if (!root) return;
+    root.querySelectorAll('pre > code').forEach((code) => {
+      if (code.dataset.enhanced) return;
+      code.dataset.enhanced = '1';
+      try { if (window.hljs) window.hljs.highlightElement(code); } catch (e) { /* ignore */ }
+      const btn = document.createElement('button');
+      btn.className = 'copy-btn';
+      btn.textContent = 'Copy';
+      btn.onclick = () => {
+        navigator.clipboard.writeText(code.innerText).then(() => {
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+        });
+      };
+      code.parentElement.classList.add('has-copy');
+      code.parentElement.appendChild(btn);
     });
   }
 
-  // Global Toast Helper
+  // ── Toasts ──────────────────────────────────────────────────────────────
   window.showToast = function (message, type = 'info') {
     let container = document.getElementById('toast-container');
     if (!container) {
@@ -36,33 +72,19 @@
     container.appendChild(toast);
     setTimeout(() => {
       toast.style.opacity = '0';
-      toast.style.transform = 'translateX(20px)';
-      toast.style.transition = 'all 0.2s ease';
+      toast.style.transition = 'opacity 0.2s ease';
       setTimeout(() => toast.remove(), 200);
-    }, 3500);
+    }, type === 'error' ? 6000 : 3500);
   };
 
-  // Auth Handling
+  // ── Auth ────────────────────────────────────────────────────────────────
   window.switchTab = function (tab) {
-    const loginTab = document.getElementById('login-tab');
-    const regTab = document.getElementById('register-tab');
-    const regFields = document.getElementById('register-fields');
-    const submitBtn = document.getElementById('auth-submit');
-    const errorEl = document.getElementById('auth-error');
-
-    if (errorEl) errorEl.classList.add('hidden');
-
-    if (tab === 'register') {
-      loginTab.classList.remove('active');
-      regTab.classList.add('active');
-      regFields.classList.remove('hidden');
-      submitBtn.textContent = 'Create Account';
-    } else {
-      regTab.classList.remove('active');
-      loginTab.classList.add('active');
-      regFields.classList.add('hidden');
-      submitBtn.textContent = 'Sign In';
-    }
+    const isReg = tab === 'register';
+    document.getElementById('auth-error').classList.add('hidden');
+    document.getElementById('login-tab').classList.toggle('active', !isReg);
+    document.getElementById('register-tab').classList.toggle('active', isReg);
+    document.getElementById('register-fields').classList.toggle('hidden', !isReg);
+    document.getElementById('auth-submit').textContent = isReg ? 'Create Account' : 'Sign In';
   };
 
   window.handleAuth = async function (e) {
@@ -70,19 +92,14 @@
     const isRegister = document.getElementById('register-tab').classList.contains('active');
     const email = document.getElementById('auth-email').value.trim();
     const password = document.getElementById('auth-password').value;
-    const name = document.getElementById('auth-name') ? document.getElementById('auth-name').value.trim() : '';
+    const name = (document.getElementById('auth-name') || {}).value || '';
     const errorEl = document.getElementById('auth-error');
     const submitBtn = document.getElementById('auth-submit');
-
     errorEl.classList.add('hidden');
     submitBtn.disabled = true;
-
     try {
-      if (isRegister) {
-        await window.API.register(email, password, name);
-      } else {
-        await window.API.login(email, password);
-      }
+      if (isRegister) await window.API.register(email, password, name.trim());
+      else await window.API.login(email, password);
       await bootstrapApp();
     } catch (err) {
       errorEl.textContent = err.message || 'Authentication failed';
@@ -92,9 +109,7 @@
     }
   };
 
-  window.onAuthUnauthorized = function () {
-    showAuthView();
-  };
+  window.onAuthUnauthorized = function () { showAuthView(); };
 
   function showAuthView() {
     document.getElementById('auth-page').classList.remove('hidden');
@@ -106,33 +121,26 @@
     document.getElementById('app').classList.remove('hidden');
   }
 
-  // App Bootstrap
+  // ── Bootstrap ───────────────────────────────────────────────────────────
+  let bootstrapped = false;
   async function bootstrapApp() {
-    const token = window.API.getToken();
-    if (!token) {
-      showAuthView();
-      return;
-    }
-
+    if (!window.API.getToken()) { showAuthView(); return; }
     try {
       const meRes = await window.API.getMe();
       window.Store.setUser(meRes.user);
       renderUserProfile(meRes.user);
       showAppView();
-
-      // Load initial state in parallel
-      await Promise.allSettled([
-        loadModels(),
-        loadWorkspaces(),
-        loadConversations(),
-      ]);
-
-      // Initialize UI components
-      window.ModelSelector.init();
-      window.ActivityLog.init();
-      window.CommandPalette.init();
-      setupGlobalKeybindings();
-
+      if (!bootstrapped) {
+        window.ModelSelector.init();
+        window.ActivityLog.init();
+        window.CommandPalette.init();
+        setupGlobalKeybindings();
+        bootstrapped = true;
+      }
+      await Promise.allSettled([loadModels(), loadWorkspaces(), loadConversations()]);
+      setMode(window.Store.getState().mode, true);
+      updateRepoStatusIndicator();
+      setAgentState('IDLE');
     } catch (err) {
       console.error('Bootstrap error:', err);
       showAuthView();
@@ -141,35 +149,31 @@
 
   function renderUserProfile(user) {
     if (!user) return;
-    const nameEl = document.getElementById('user-name');
-    const emailEl = document.getElementById('user-email');
-    const avatarEl = document.getElementById('user-avatar');
-
-    if (nameEl) nameEl.textContent = user.name || user.email.split('@')[0];
-    if (emailEl) emailEl.textContent = user.email;
-    if (avatarEl) {
-      const initial = (user.name || user.email || 'U')[0].toUpperCase();
-      avatarEl.textContent = initial;
-    }
+    document.getElementById('user-name').textContent = user.name || user.email.split('@')[0];
+    document.getElementById('user-email').textContent = user.email;
+    document.getElementById('user-avatar').textContent = (user.name || user.email || 'U')[0].toUpperCase();
   }
 
   async function loadModels() {
     try {
-      const models = await window.API.getModels();
-      window.Store.setModels(models);
+      window.Store.setModels(await window.API.getModels());
       window.ModelSelector.render();
     } catch (err) {
       console.warn('Could not load models:', err);
     }
   }
+  window.reloadModels = loadModels;
+
+  // ── Workspaces ──────────────────────────────────────────────────────────
+  let workspacePolicy = { allow_any_path: true, allow_git_clone: true };
 
   async function loadWorkspaces() {
     try {
       const res = await window.API.listWorkspaces();
+      workspacePolicy = res.policy || workspacePolicy;
       window.Store.setWorkspaces(res.workspaces || []);
       renderWorkspacesList(res.workspaces || []);
-
-      if (res.workspaces && res.workspaces.length > 0 && !window.Store.getState().activeWorkspace) {
+      if (res.workspaces && res.workspaces.length && !window.Store.getState().activeWorkspace) {
         selectWorkspace(res.workspaces[0].id);
       }
     } catch (err) {
@@ -180,36 +184,36 @@
   function renderWorkspacesList(workspaces) {
     const container = document.getElementById('workspace-selector');
     if (!container) return;
-
-    if (!workspaces || workspaces.length === 0) {
-      container.innerHTML = '<div class="workspace-empty" onclick="showWorkspaceModal()" style="cursor:pointer;">+ Add your first workspace</div>';
+    if (!workspaces || !workspaces.length) {
+      container.innerHTML = '<div class="workspace-empty" onclick="showWorkspaceModal()">+ Add your first workspace</div>';
       return;
     }
-
-    const activeWs = window.Store.getState().activeWorkspace;
-    let html = '<select class="workspace-dropdown-select" onchange="selectWorkspace(this.value)" style="width:100%; padding:6px 8px; font-size:12px; background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius-sm); color:var(--text-0); outline:none;">';
-    for (const ws of workspaces) {
-      const isSelected = activeWs && activeWs.id === ws.id;
-      html += `<option value="${ws.id}" ${isSelected ? 'selected' : ''}>📁 ${ws.name} (${ws.branch || 'main'})</option>`;
-    }
-    html += '</select>';
-    container.innerHTML = html;
+    const active = window.Store.getState().activeWorkspace;
+    container.innerHTML = `
+      <select class="workspace-dropdown-select" onchange="selectWorkspace(this.value)" aria-label="Workspace">
+        ${workspaces.map(ws => `<option value="${ws.id}" ${active && active.id === ws.id ? 'selected' : ''}>
+          ${escapeHtml(ws.name)}${ws.branch ? ` (${escapeHtml(ws.branch)})` : ''}</option>`).join('')}
+      </select>
+      ${active ? `<div class="workspace-path" title="${escapeHtml(active.repo_path)}">${escapeHtml(active.repo_path)}</div>` : ''}`;
   }
 
-  window.selectWorkspace = async function (wsId) {
+  window.selectWorkspace = function (wsId) {
     wsId = parseInt(wsId, 10);
     const state = window.Store.getState();
     const ws = (state.workspaces || []).find(w => w.id === wsId);
     if (!ws) return;
-
     window.Store.setActiveWorkspace(ws);
     renderWorkspacesList(state.workspaces);
     updateRepoStatusIndicator();
-
-    // Fetch workspace files and git status
-    loadWorkspaceFiles(ws.id);
-    loadGitStatus(ws.id);
+    refreshWorkspaceSideData(ws.id);
+    if (ws.index_status === 'indexing') pollIndexStatus(ws.id);
   };
+
+  function refreshWorkspaceSideData(wsId) {
+    loadWorkspaceFiles(wsId);
+    loadGitStatus(wsId);
+  }
+  window.refreshWorkspaceSideData = refreshWorkspaceSideData;
 
   async function loadWorkspaceFiles(wsId) {
     try {
@@ -224,117 +228,83 @@
   function renderFileTree(files) {
     const container = document.getElementById('file-tree');
     if (!container) return;
-
-    if (!files || files.length === 0) {
-      container.innerHTML = '<div class="files-empty">No files indexed.<br/><button class="btn btn-secondary" style="margin-top:8px; font-size:11px; padding:4px 8px;" onclick="indexCurrentWorkspace()">Index Now</button></div>';
+    if (!files || !files.length) {
+      container.innerHTML = '<div class="files-empty">No files found.<br/><button class="btn btn-secondary btn-sm" style="margin-top:8px" onclick="indexCurrentWorkspace()">Re-index</button></div>';
       return;
     }
-
-    let html = '';
-    for (const f of files.slice(0, 100)) {
-      html += `
-        <div class="file-tree-item" onclick="openFileInChat('${f.path}')" title="${f.path}">
-          <span class="file-icon">📄</span>
-          <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${f.path}</span>
-        </div>
-      `;
-    }
-    if (files.length > 100) {
-      html += `<div style="font-size:11px; color:var(--text-3); padding:4px 6px;">+ ${files.length - 100} more files</div>`;
-    }
-    container.innerHTML = html;
+    const shown = files.slice(0, 300);
+    container.innerHTML = shown.map(f => `
+      <div class="file-tree-item" data-path="${escapeHtml(f.path)}" title="${escapeHtml(f.path)}">
+        <span class="file-icon">📄</span><span class="file-tree-path">${escapeHtml(f.path)}</span>
+      </div>`).join('') +
+      (files.length > shown.length ? `<div class="files-more">+ ${files.length - shown.length} more — use the filter</div>` : '');
+    container.querySelectorAll('.file-tree-item').forEach(el => {
+      el.onclick = () => window.openFileInChat(el.dataset.path);
+    });
   }
 
   window.filterFiles = function (query) {
     const q = (query || '').toLowerCase().trim();
     const all = window.Store.getState().files || [];
-    if (!q) {
-      renderFileTree(all);
-      return;
-    }
-    const filtered = all.filter(f => f.path.toLowerCase().includes(q));
-    renderFileTree(filtered);
+    renderFileTree(q ? all.filter(f => f.path.toLowerCase().includes(q)) : all);
   };
 
   window.openFileInChat = function (filePath) {
     const input = document.getElementById('chat-input');
-    if (input) {
-      input.value = `Inspect file: ${filePath}\n` + input.value;
-      input.focus();
-    }
+    if (!input) return;
+    const insert = `\`${filePath}\` `;
+    input.value = input.value ? `${input.value.trimEnd()} ${insert}` : `Explain ${insert}`;
+    input.focus();
+    autoResizeTextarea(input);
   };
 
+  // ── Git panel ───────────────────────────────────────────────────────────
   async function loadGitStatus(wsId) {
     const panel = document.getElementById('git-panel');
     if (!panel) return;
-
-    try {
-      const [status, gitLog] = await Promise.allSettled([
-        window.API.getGitStatus(wsId),
-        window.API.getGitLog(wsId),
-      ]);
-
-      const st = status.status === 'fulfilled' ? status.value : null;
-      const lg = gitLog.status === 'fulfilled' ? gitLog.value : null;
-
-      if (!st || !st.is_repo) {
-        panel.innerHTML = '<div class="git-empty">Directory is not a Git repository</div>';
-        return;
-      }
-
-      let html = `
-        <div class="git-section">
-          <div class="git-section-title">CURRENT BRANCH</div>
-          <div class="git-branch">⎇ ${st.branch || 'main'}</div>
-        </div>
-        <div class="git-section">
-          <div class="git-section-title">WORKING TREE</div>
-      `;
-
-      if (st.clean) {
-        html += '<div style="font-size:12px; color:var(--green); padding:4px 0;">✓ Working tree clean</div>';
-      } else {
-        const changes = st.changes || [];
-        for (const c of changes.slice(0, 10)) {
-          html += `<div class="git-status-line">${c}</div>`;
-        }
-      }
-
-      html += `
-        </div>
-        <div class="git-actions">
-          <button class="git-btn" onclick="createCheckpoint()">Save Checkpoint</button>
-          <button class="git-btn" onclick="restoreCheckpoint()">Restore</button>
-        </div>
-      `;
-
-      if (lg && lg.commits && lg.commits.length > 0) {
-        html += '<div class="git-section" style="margin-top:14px;"><div class="git-section-title">RECENT COMMITS</div>';
-        for (const cm of lg.commits.slice(0, 5)) {
-          html += `
-            <div style="font-size:11px; padding:4px 0; border-bottom:1px solid var(--border);">
-              <div style="color:var(--text-0); font-weight:500;">${cm.subject || cm.hash}</div>
-              <div style="color:var(--text-3); font-size:10px;">${cm.author || ''} • ${cm.date || ''}</div>
-            </div>
-          `;
-        }
-        html += '</div>';
-      }
-
-      panel.innerHTML = html;
-    } catch (e) {
-      panel.innerHTML = '<div class="git-empty">Could not load Git status</div>';
+    const [status, gitLog, cps] = await Promise.allSettled([
+      window.API.getGitStatus(wsId), window.API.getGitLog(wsId), window.API.listGitCheckpoints(wsId),
+    ]);
+    const st = status.status === 'fulfilled' ? status.value : null;
+    if (!st || !st.is_repo) {
+      panel.innerHTML = '<div class="git-empty">Not a Git repository. CodeSage still keeps the original of every file it changes, so applied changes can be reverted.</div>';
+      return;
     }
+    const commits = gitLog.status === 'fulfilled' ? (gitLog.value.commits || []) : [];
+    const checkpoints = cps.status === 'fulfilled' ? (cps.value.checkpoints || []) : [];
+    const changes = st.changes || [];
+    panel.innerHTML = `
+      <div class="git-section">
+        <div class="git-section-title">BRANCH</div>
+        <div class="git-branch">⎇ ${escapeHtml(st.branch || '?')} <span class="git-head">${escapeHtml(st.head || '')}</span>
+          ${st.ahead ? `<span class="git-ab">↑${st.ahead}</span>` : ''}${st.behind ? `<span class="git-ab">↓${st.behind}</span>` : ''}</div>
+      </div>
+      <div class="git-section">
+        <div class="git-section-title">WORKING TREE</div>
+        ${st.clean ? '<div class="git-clean">✓ Clean</div>' : changes.slice(0, 30).map(c =>
+          `<div class="git-status-line"><span class="git-code git-${escapeHtml(c.label)}">${escapeHtml(c.code.trim() || '?')}</span> ${escapeHtml(c.path)}</div>`).join('')}
+        ${changes.length > 30 ? `<div class="files-more">+ ${changes.length - 30} more</div>` : ''}
+      </div>
+      <div class="git-section">
+        <div class="git-section-title">CHECKPOINTS <span class="git-hint" title="Snapshots are saved with git stash create/store; your working tree is never modified by saving one.">?</span></div>
+        <div class="git-actions"><button class="git-btn" onclick="createCheckpoint()">Save checkpoint</button></div>
+        ${checkpoints.slice(0, 6).map(c => `
+          <div class="checkpoint-item">
+            <div><div class="checkpoint-msg">${escapeHtml(c.message.replace(/^.*codesage:\s*/, ''))}</div>
+            <div class="checkpoint-date">${escapeHtml(c.sha.slice(0, 8))} · ${escapeHtml(c.date)}</div></div>
+            <button class="git-btn" onclick="restoreCheckpoint('${escapeHtml(c.sha)}')">Restore</button>
+          </div>`).join('') || '<div class="git-hint-text">No checkpoints yet. One is saved automatically before each applied change.</div>'}
+      </div>
+      ${commits.length ? `<div class="git-section"><div class="git-section-title">RECENT COMMITS</div>
+        ${commits.slice(0, 6).map(cm => `<div class="commit-item"><div class="commit-subject">${escapeHtml(cm.subject)}</div>
+          <div class="checkpoint-date">${escapeHtml(cm.hash)} · ${escapeHtml(cm.author)} · ${escapeHtml(cm.date)}</div></div>`).join('')}</div>` : ''}`;
   }
 
   window.createCheckpoint = async function () {
     const ws = window.Store.getState().activeWorkspace;
-    if (!ws) {
-      window.showToast('Please select a workspace first', 'error');
-      return;
-    }
+    if (!ws) return window.showToast('Select a workspace first', 'error');
     try {
-      const res = await window.API.createGitCheckpoint(ws.id, 'User manual checkpoint');
+      const res = await window.API.createGitCheckpoint(ws.id, 'manual checkpoint');
       window.showToast(res.message || 'Checkpoint saved', 'success');
       loadGitStatus(ws.id);
     } catch (err) {
@@ -342,91 +312,97 @@
     }
   };
 
-  window.restoreCheckpoint = async function () {
+  window.restoreCheckpoint = async function (sha) {
     const ws = window.Store.getState().activeWorkspace;
-    if (!ws) {
-      window.showToast('Please select a workspace first', 'error');
-      return;
-    }
-    if (!confirm('Restore most recent checkpoint? Uncommitted changes will be restored.')) return;
+    if (!ws) return;
+    if (!confirm('Restore tracked files to this checkpoint?\n\nYour current state is saved as a new checkpoint first, so this can be undone. Untracked files are not touched.')) return;
     try {
-      const res = await window.API.restoreGitCheckpoint(ws.id);
+      const res = await window.API.restoreGitCheckpoint(ws.id, sha);
       window.showToast(res.message || 'Checkpoint restored', 'success');
-      loadGitStatus(ws.id);
-      loadWorkspaceFiles(ws.id);
+      refreshWorkspaceSideData(ws.id);
     } catch (err) {
       window.showToast(`Restore error: ${err.message}`, 'error');
     }
   };
 
-  window.indexCurrentWorkspace = async function () {
+  // ── Indexing ────────────────────────────────────────────────────────────
+  window.indexCurrentWorkspace = async function (force = false) {
     const ws = window.Store.getState().activeWorkspace;
-    if (!ws) {
-      window.showToast('Select a workspace to index', 'error');
-      return;
-    }
-    window.showToast('Started indexing repository...', 'info');
+    if (!ws) return window.showToast('Select a workspace to index', 'error');
     try {
-      await window.API.indexWorkspace(ws.id);
+      await window.API.indexWorkspace(ws.id, force);
+      window.showToast(force ? 'Rebuilding index…' : 'Refreshing index…', 'info');
       pollIndexStatus(ws.id);
     } catch (err) {
       window.showToast(`Indexing failed: ${err.message}`, 'error');
     }
   };
 
+  let indexTimer = null;
   function pollIndexStatus(wsId) {
-    const timer = setInterval(async () => {
+    clearInterval(indexTimer);
+    const status = document.getElementById('repo-context-status');
+    indexTimer = setInterval(async () => {
       try {
         const st = await window.API.getIndexStatus(wsId);
-        if (st.status === 'done') {
-          clearInterval(timer);
-          window.showToast(`Indexing complete: ${st.total_files} files, ${st.total_chunks} code chunks`, 'success');
+        if (st.status === 'indexing' && status) {
+          status.textContent = `Indexing… ${st.indexed_files || 0}/${st.total_files || '?'} files`;
+        } else if (st.status === 'done') {
+          clearInterval(indexTimer);
+          updateRepoStatusIndicator();
           loadWorkspaceFiles(wsId);
         } else if (st.status === 'error') {
-          clearInterval(timer);
-          window.showToast(`Indexing failed: ${st.error || 'Unknown error'}`, 'error');
+          clearInterval(indexTimer);
+          window.showToast(`Indexing failed: ${st.error || 'unknown error'}`, 'error');
+          updateRepoStatusIndicator();
         }
       } catch (e) {
-        clearInterval(timer);
+        clearInterval(indexTimer);
       }
-    }, 1500);
+    }, 1000);
   }
 
-  // Workspace Modal
+  // ── Workspace modal ─────────────────────────────────────────────────────
   window.showWorkspaceModal = function () {
     document.getElementById('workspace-modal').classList.remove('hidden');
     document.getElementById('ws-error').classList.add('hidden');
     document.getElementById('ws-path').value = '';
     document.getElementById('ws-name').value = '';
+    document.getElementById('ws-git').value = '';
+    document.getElementById('ws-git-group').classList.toggle('hidden', !workspacePolicy.allow_git_clone);
+    document.getElementById('ws-path-hint').textContent = workspacePolicy.allow_any_path
+      ? 'Absolute path to a directory on the machine running CodeSage'
+      : 'Path inside your workspace folder on the server (or clone a repository above)';
+    setTimeout(() => document.getElementById('ws-path').focus(), 30);
   };
 
   window.createWorkspace = async function () {
     const name = document.getElementById('ws-name').value.trim();
     const repoPath = document.getElementById('ws-path').value.trim();
+    const gitUrl = document.getElementById('ws-git').value.trim();
     const errorEl = document.getElementById('ws-error');
     const btn = document.getElementById('ws-submit-btn');
-
-    if (!repoPath) {
-      errorEl.textContent = 'Repository path is required';
+    if (!repoPath && !gitUrl) {
+      errorEl.textContent = 'Enter a repository path or a git URL';
       errorEl.classList.remove('hidden');
       return;
     }
-
     btn.disabled = true;
+    btn.textContent = gitUrl ? 'Cloning…' : 'Adding…';
     errorEl.classList.add('hidden');
-
     try {
-      const ws = await window.API.createWorkspace(name, repoPath);
+      const ws = await window.API.createWorkspace(name, repoPath || undefined, gitUrl || undefined);
       closeModal('workspace-modal');
-      window.showToast(`Workspace "${ws.name}" added`, 'success');
+      window.showToast(`Workspace "${ws.name}" added — indexing in the background`, 'success');
       await loadWorkspaces();
       selectWorkspace(ws.id);
-      window.indexCurrentWorkspace();
+      pollIndexStatus(ws.id);
     } catch (err) {
       errorEl.textContent = err.message || 'Failed to add workspace';
       errorEl.classList.remove('hidden');
     } finally {
       btn.disabled = false;
+      btn.textContent = 'Add Workspace';
     }
   };
 
@@ -435,177 +411,195 @@
     if (el) el.classList.add('hidden');
   };
 
-  // Conversations
+  // ── Conversations ───────────────────────────────────────────────────────
   async function loadConversations(search = '') {
     const listEl = document.getElementById('conversations-list');
-    if (!listEl) return;
-
     try {
       const res = await window.API.listConversations(search);
       window.Store.setConversations(res.conversations || []);
       renderConversationsList(res.conversations || []);
     } catch (err) {
-      listEl.innerHTML = '<div class="sidebar-loading">Could not load chats</div>';
+      if (listEl) listEl.innerHTML = '<div class="sidebar-loading">Could not load chats</div>';
     }
   }
 
   function renderConversationsList(conversations) {
     const listEl = document.getElementById('conversations-list');
     if (!listEl) return;
-
-    if (!conversations || conversations.length === 0) {
+    if (!conversations || !conversations.length) {
       listEl.innerHTML = '<div class="sidebar-loading">No chats yet</div>';
       return;
     }
-
     const activeId = window.Store.getState().activeConversationId;
-    let html = '';
-    for (const c of conversations) {
-      const isActive = activeId === c.id;
-      html += `
-        <div class="conv-item ${isActive ? 'active' : ''}" onclick="selectConversation(${c.id})">
-          <span class="conv-title">${escapeHtml(c.title || 'Untitled Chat')}</span>
-          <div class="conv-actions" onclick="event.stopPropagation()">
-            <button class="conv-action-btn" title="Delete chat" onclick="deleteConversation(${c.id})">✕</button>
-          </div>
+    listEl.innerHTML = conversations.map(c => `
+      <div class="conv-item ${activeId === c.id ? 'active' : ''}" onclick="selectConversation(${c.id})" title="${escapeHtml(c.title)}">
+        <span class="conv-title">${escapeHtml(c.title || 'Untitled Chat')}</span>
+        <div class="conv-actions" onclick="event.stopPropagation()">
+          <button class="conv-action-btn" title="Delete chat" onclick="deleteConversation(${c.id})">✕</button>
         </div>
-      `;
-    }
-    listEl.innerHTML = html;
+      </div>`).join('');
   }
 
+  let searchTimer = null;
   window.filterChats = function (q) {
-    loadConversations(q);
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadConversations(q), 200);
   };
 
   window.newChat = function () {
+    if (agentState !== 'IDLE') return window.showToast('Stop the current request first (Esc)', 'info');
     window.Store.setActiveConversation(null, []);
-    const titleEl = document.getElementById('chat-title');
-    if (titleEl) titleEl.textContent = 'New Chat';
+    document.getElementById('chat-title').textContent = 'New Chat';
     renderMessages([]);
-    const state = window.Store.getState();
-    renderConversationsList(state.conversations);
+    renderConversationsList(window.Store.getState().conversations);
+    window.refreshChangesPanel();
+    window.ActivityLog.renderPanel([]);
     const input = document.getElementById('chat-input');
-    if (input) {
-      input.value = '';
-      input.focus();
-    }
+    input.value = '';
+    input.focus();
   };
 
   window.selectConversation = async function (convId) {
+    if (agentState !== 'IDLE') return window.showToast('Stop the current request first (Esc)', 'info');
+    await openConversation(convId);
+  };
+
+  async function openConversation(convId, { scroll = true } = {}) {
     try {
       const conv = await window.API.getConversation(convId);
       window.Store.setActiveConversation(conv.id, conv.messages || []);
-      const titleEl = document.getElementById('chat-title');
-      if (titleEl) titleEl.textContent = conv.title || 'Chat';
-      renderMessages(conv.messages || []);
+      document.getElementById('chat-title').textContent = conv.title || 'Chat';
+      renderMessages(conv.messages || [], scroll);
       const state = window.Store.getState();
       renderConversationsList(state.conversations);
-
+      const lastAssistant = [...(conv.messages || [])].reverse().find(m => m.role === 'assistant');
+      window.ActivityLog.renderPanel(lastAssistant ? lastAssistant.activity_log || [] : []);
+      window.refreshChangesPanel();
       if (conv.workspace_id && (!state.activeWorkspace || state.activeWorkspace.id !== conv.workspace_id)) {
         selectWorkspace(conv.workspace_id);
       }
+      return conv;
     } catch (err) {
       window.showToast('Could not open chat: ' + err.message, 'error');
+      return null;
     }
-  };
+  }
 
   window.deleteConversation = async function (convId) {
-    if (!confirm('Delete this conversation?')) return;
+    if (!confirm('Delete this conversation? Files are not affected.')) return;
     try {
       await window.API.deleteConversation(convId);
-      const state = window.Store.getState();
-      if (state.activeConversationId === convId) {
-        newChat();
-      }
+      if (window.Store.getState().activeConversationId === convId) window.newChat();
       loadConversations();
     } catch (err) {
       window.showToast('Could not delete: ' + err.message, 'error');
     }
   };
 
-  // Chat Rendering & Interaction
-  function renderMessages(messages) {
-    const container = document.getElementById('messages-container');
-    if (!container) return;
-
-    if (!messages || messages.length === 0) {
-      container.innerHTML = `
-        <div class="empty-state" id="empty-state">
-          <div class="empty-icon">⚡</div>
-          <h2>Start building with AI</h2>
-          <p>Ask anything about your codebase, debug issues, or request code changes.</p>
-          <div class="suggestions-grid">
-            <button class="suggestion-btn" onclick="sendSuggestion('Explain this project\\'s architecture')">Explain this project</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('Find potential security vulnerabilities')">Find security issues</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('How does authentication work in this codebase?')">Explain auth flow</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('Add unit tests for the main service')">Add unit tests</button>
-          </div>
-        </div>
-      `;
+  // ── Changes panel (right sidebar) ───────────────────────────────────────
+  window.refreshChangesPanel = function () {
+    const panel = document.getElementById('changes-panel');
+    if (!panel) return;
+    const changes = window.Store.getState().messages.filter(m => m.change).map(m => m.change);
+    if (!changes.length) {
+      panel.innerHTML = '<div class="changes-empty">No proposed changes in this chat</div>';
       return;
     }
+    panel.innerHTML = changes.slice().reverse().map(c => `
+      <div class="change-item" onclick="document.getElementById('change-${escapeHtml(c.id)}')?.scrollIntoView({behavior:'smooth', block:'center'})">
+        <span class="change-status ${escapeHtml(c.status)}"></span>
+        <div class="change-item-body">
+          <div class="change-path">${c.files.map(f => escapeHtml(f.path)).join(', ')}</div>
+          <div class="change-item-meta">${escapeHtml(c.status)} · <span class="stat-add">+${c.additions}</span> <span class="stat-remove">−${c.deletions}</span></div>
+        </div>
+      </div>`).join('');
+  };
 
-    container.innerHTML = '';
-    const fragment = document.createDocumentFragment();
+  // ── Message rendering ───────────────────────────────────────────────────
+  const EMPTY_STATE = `
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">⚡</div>
+      <h2>What should we work on?</h2>
+      <p>Ask about your codebase, or ask for a change — CodeSage shows a diff and writes nothing until you accept it.</p>
+      <div class="suggestions-grid">
+        <button class="suggestion-btn" onclick="sendSuggestion('Explain this project')">Explain this project</button>
+        <button class="suggestion-btn" onclick="sendSuggestion('How does authentication work in this codebase?')">How does auth work?</button>
+        <button class="suggestion-btn" onclick="sendSuggestion('Find potential bugs in the error handling')">Find potential bugs</button>
+        <button class="suggestion-btn" onclick="sendSuggestion('Add a docstring to the main module explaining its purpose')">Add a docstring</button>
+      </div>
+    </div>`;
 
-    for (const msg of messages) {
-      const msgEl = createMessageElement(msg);
-      fragment.appendChild(msgEl);
+  function renderMessages(messages, scroll = true) {
+    const container = document.getElementById('messages-container');
+    if (!container) return;
+    if (!messages || !messages.length) {
+      container.innerHTML = EMPTY_STATE;
+      return;
     }
-
-    container.appendChild(fragment);
-    container.scrollTop = container.scrollHeight;
+    const lastUserIdx = messages.map(m => m.role).lastIndexOf('user');
+    container.innerHTML = messages.map((m, i) => messageHtml(m, { isLastTurn: i >= lastUserIdx })).join('');
+    enhanceCode(container);
+    if (scroll) container.scrollTop = container.scrollHeight;
   }
 
-  function createMessageElement(msg) {
-    const el = document.createElement('div');
-    el.className = `message message-${msg.role}`;
-    el.style.cssText = 'padding: 16px 24px; display: flex; gap: 14px; border-bottom: 1px solid var(--border);';
+  function metricsHtml(msg) {
+    const m = (msg.meta || {}).metrics;
+    if (!m) return '';
+    const parts = [];
+    if (m.model) parts.push(escapeHtml(m.model));
+    if (m.total_ms) parts.push(`${(m.total_ms / 1000).toFixed(1)}s`);
+    if (m.ttft_ms) parts.push(`first token ${(m.ttft_ms / 1000).toFixed(1)}s`);
+    if (m.input_tokens || m.output_tokens) {
+      parts.push(`${(m.input_tokens || 0).toLocaleString()} in / ${(m.output_tokens || 0).toLocaleString()} out${m.tokens_estimated ? ' (est.)' : ''}`);
+    }
+    if (m.cost_usd) parts.push(`~$${m.cost_usd.toFixed(4)}`);
+    return `<div class="message-metrics" title="Stage timings (ms): ${escapeHtml(JSON.stringify(m.timings || {}))}">${parts.join(' · ')}</div>`;
+  }
 
+  function messageHtml(msg, { isLastTurn = false } = {}) {
     const isAssistant = msg.role === 'assistant';
-    const avatar = isAssistant ? '⚡' : '👤';
-    const sender = isAssistant ? (msg.model ? `CodeSage (${msg.model})` : 'CodeSage') : 'You';
-
-    let contentHtml = '';
-    if (isAssistant && msg.activity_log && msg.activity_log.length > 0) {
-      contentHtml += window.ActivityLog.renderInline(msg.activity_log);
+    const status = msg.status || 'complete';
+    const meta = msg.meta || {};
+    let body = '';
+    if (isAssistant && msg.activity_log && msg.activity_log.length) {
+      body += window.ActivityLog.renderInline(msg.activity_log, { stopped: status === 'cancelled' });
     }
-
-    if (window.marked && msg.content) {
-      contentHtml += window.marked.parse(msg.content);
+    if (isAssistant && status === 'error') {
+      const err = meta.error || {};
+      body += `<div class="message-error"><strong>Request failed.</strong> ${escapeHtml(err.message || msg.content.replace(/^\*\*Request failed:\*\*\s*/, ''))}</div>`;
     } else {
-      contentHtml += `<pre style="white-space:pre-wrap; font-family:inherit;">${escapeHtml(msg.content || '')}</pre>`;
+      body += `<div class="markdown">${isAssistant ? renderMarkdown(msg.content) : `<p class="user-text">${escapeHtml(msg.content)}</p>`}</div>`;
     }
+    if (msg.change) body += window.Proposals.renderChange(msg.change, { hideSummary: !!msg.change.summary && (msg.content || '').startsWith(msg.change.summary) });
+    if (msg.command) body += window.Proposals.renderCommand(msg.command);
 
-    el.innerHTML = `
-      <div style="width:28px; height:28px; border-radius:50%; background:${isAssistant ? 'var(--surface-2)' : 'var(--accent-dim)'}; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:14px; margin-top:2px;">
-        ${avatar}
-      </div>
-      <div style="flex:1; min-width:0;">
-        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
-          <span style="font-size:12px; font-weight:600; color:${isAssistant ? 'var(--accent)' : 'var(--text-1)'};">${sender}</span>
-          ${msg.input_tokens ? `<span style="font-size:10px; color:var(--text-3); font-family:var(--font-mono);">${msg.input_tokens + msg.output_tokens} tok</span>` : ''}
+    let footer = '';
+    if (isAssistant) {
+      const retry = (status === 'error' && (meta.error || {}).retryable !== false) || status === 'cancelled';
+      footer = `<div class="message-footer">${metricsHtml(msg)}
+        ${retry && isLastTurn ? `<button class="btn btn-secondary btn-sm" onclick="retryLast()">↻ Retry</button>` : ''}
+        ${status === 'cancelled' ? '<span class="status-badge rejected">Stopped</span>' : ''}</div>`;
+    }
+    const sender = isAssistant ? 'CodeSage' : 'You';
+    return `
+      <div class="message message-${msg.role} ${status !== 'complete' ? 'message-' + status : ''}" data-msg-id="${msg.id || ''}">
+        <div class="message-avatar">${isAssistant ? '⚡' : '👤'}</div>
+        <div class="message-main">
+          <div class="message-sender">${sender}${isAssistant && meta.mode ? ` <span class="mode-chip">${escapeHtml(meta.mode)} · ${escapeHtml((meta.scope || '').replace('_', ' '))}</span>` : ''}</div>
+          <div class="message-body">${body}</div>
+          ${footer}
         </div>
-        <div class="message-body" style="line-height:1.6; color:var(--text-0); font-size:13px;">
-          ${contentHtml}
-        </div>
-      </div>
-    `;
-
-    return el;
+      </div>`;
   }
 
   window.sendSuggestion = function (text) {
     const input = document.getElementById('chat-input');
-    if (input) {
-      input.value = text;
-      sendMessage();
-    }
+    input.value = text;
+    sendMessage();
   };
 
   window.handleInputKeydown = function (e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       sendMessage();
     }
@@ -613,121 +607,193 @@
 
   window.autoResizeTextarea = function (el) {
     el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   };
 
-  window.sendMessage = async function () {
+  // ── Agent state machine ────────────────────────────────────────────────
+  let agentState = 'IDLE';          // IDLE | RUNNING | STOPPING
+  let currentRun = null;            // {requestId, controller, stopTimer}
+
+  function setAgentState(next) {
+    agentState = next;
     const input = document.getElementById('chat-input');
-    const text = (input ? input.value : '').trim();
-    if (!text) return;
-
-    const state = window.Store.getState();
-    if (state.isStreaming) return;
-
-    input.value = '';
-    input.style.height = 'auto';
-
-    // Add user message to state & UI
-    const userMsg = { role: 'user', content: text };
-    window.Store.addMessage(userMsg);
-
-    // Prepare assistant message
-    const assistantMsg = { role: 'assistant', content: '', activity_log: [] };
-    window.Store.addMessage(assistantMsg);
-    window.Store.setStreaming(true, '');
-
-    renderMessages(window.Store.getState().messages);
-
-    const messagesContainer = document.getElementById('messages-container');
-    const lastMsgBody = messagesContainer.lastElementChild ? messagesContainer.lastElementChild.querySelector('.message-body') : null;
-
-    try {
-      await window.API.streamChat(
-        {
-          conversation_id: state.activeConversationId,
-          message: text,
-          provider: state.selectedProvider,
-          model: state.selectedModel,
-          use_repo: state.useRepo,
-          workspace_id: state.activeWorkspace ? state.activeWorkspace.id : null,
-          mode: state.mode,
-        },
-        {
-          onActivity: (items) => {
-            window.Store.setActivityLog(items);
-            if (lastMsgBody) {
-              const currentContent = window.Store.getState().streamingContent;
-              lastMsgBody.innerHTML = window.ActivityLog.renderInline(items) + (window.marked ? window.marked.parse(currentContent) : currentContent);
-              messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-          },
-          onChunk: (chunk) => {
-            window.Store.appendStreamingChunk(chunk);
-            if (lastMsgBody) {
-              const fullText = window.Store.getState().streamingContent;
-              const currentActivity = window.Store.getState().activityLog;
-              lastMsgBody.innerHTML = (currentActivity && currentActivity.length ? window.ActivityLog.renderInline(currentActivity) : '') + (window.marked ? window.marked.parse(fullText) : fullText);
-              messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-          },
-          onDone: (event) => {
-            window.Store.setStreaming(false);
-            const fullText = window.Store.getState().streamingContent;
-            const activity = window.Store.getState().activityLog;
-            window.Store.updateLastMessage(fullText, activity);
-
-            if (event.conversation_id && !state.activeConversationId) {
-              window.Store.setState({ activeConversationId: event.conversation_id });
-              loadConversations();
-            }
-          },
-          onError: (err) => {
-            window.Store.setStreaming(false);
-            window.Store.updateLastMessage(`⚠️ Error: ${err.message}`);
-            renderMessages(window.Store.getState().messages);
-          },
-        }
-      );
-    } catch (err) {
-      window.Store.setStreaming(false);
-      window.Store.updateLastMessage(`⚠️ Connection error: ${err.message}`);
-      renderMessages(window.Store.getState().messages);
+    const btn = document.getElementById('send-btn');
+    const statusEl = document.getElementById('input-status');
+    window.Store.setStreaming(next !== 'IDLE');
+    if (next === 'IDLE') {
+      input.disabled = false;
+      input.placeholder = 'Ask about your code or request a change… (Enter to send, Shift+Enter for newline)';
+      btn.className = 'send-btn';
+      btn.title = 'Send (Enter)';
+      btn.innerHTML = '<span class="send-icon">↑</span>';
+      btn.onclick = () => sendMessage();
+      btn.disabled = false;
+      statusEl.textContent = '';
+    } else {
+      input.disabled = true;
+      input.placeholder = next === 'STOPPING' ? 'Stopping…' : 'CodeSage is working… (Esc to stop)';
+      btn.className = 'send-btn stop';
+      btn.title = 'Stop (Esc)';
+      btn.innerHTML = '<span class="stop-icon"></span>';
+      btn.onclick = () => stopCurrentRequest();
+      btn.disabled = next === 'STOPPING';
+      statusEl.textContent = next === 'STOPPING' ? 'Stopping…' : '';
     }
+  }
+
+  window.stopCurrentRequest = async function () {
+    if (agentState !== 'RUNNING' || !currentRun) return;
+    const run = currentRun;
+    setAgentState('STOPPING');
+    try {
+      await window.API.cancelChat(run.requestId);   // stops the server run + provider request
+    } catch (e) { /* already finished — fine */ }
+    // The server answers with a 'cancelled' event; abort the stream if it doesn't arrive promptly.
+    run.stopTimer = setTimeout(() => run.controller.abort(), 2500);
   };
 
-  // Header and UI Controls
-  window.toggleSidebar = function () {
-    const sidebar = document.getElementById('sidebar');
-    if (sidebar) sidebar.classList.toggle('open');
+  window.retryLast = function () {
+    const msgs = window.Store.getState().messages;
+    const lastUser = [...msgs].reverse().find(m => m.role === 'user');
+    if (lastUser) sendMessage(lastUser.content, { retry: true });
   };
 
-  window.toggleContextPanel = function () {
-    const panel = document.getElementById('context-panel');
-    if (panel) panel.classList.toggle('collapsed');
-  };
+  async function sendMessage(overrideText, { retry = false } = {}) {
+    const input = document.getElementById('chat-input');
+    const text = (overrideText !== undefined ? overrideText : input.value).trim();
+    if (!text || agentState !== 'IDLE') return;
+    const state = window.Store.getState();
+    if (!state.selectedProvider || !state.selectedModel) {
+      window.showToast('Choose a model first (top right)', 'error');
+      return;
+    }
+    if (overrideText === undefined) {
+      input.value = '';
+      input.style.height = 'auto';
+    }
+
+    const requestId = 'req_' + Math.random().toString(36).slice(2, 12);
+    const controller = new AbortController();
+    currentRun = { requestId, controller, stopTimer: null };
+    setAgentState('RUNNING');
+
+    // Optimistic UI: user turn + live assistant turn
+    let msgs = window.Store.getState().messages.slice();
+    if (retry) {
+      while (msgs.length && msgs[msgs.length - 1].role === 'assistant' && msgs[msgs.length - 1].status !== 'complete') msgs.pop();
+    } else {
+      msgs.push({ role: 'user', content: text, status: 'complete' });
+    }
+    window.Store.setState({ messages: msgs });
+    renderMessages(msgs);
+    const container = document.getElementById('messages-container');
+    const live = document.createElement('div');
+    live.className = 'message message-assistant message-live';
+    live.innerHTML = `<div class="message-avatar">⚡</div>
+      <div class="message-main"><div class="message-sender">CodeSage <span class="mode-chip" id="live-mode"></span></div>
+      <div class="message-body"><div id="live-activity"></div><div class="markdown" id="live-text"></div>
+      <div id="live-progress" class="live-progress"></div></div></div>`;
+    container.appendChild(live);
+    container.scrollTop = container.scrollHeight;
+
+    let streamed = '';
+    let activity = [];
+    let convId = state.activeConversationId;
+    let renderPending = false;
+    const nearBottom = () => container.scrollHeight - container.scrollTop - container.clientHeight < 120;
+
+    function paint() {
+      renderPending = false;
+      const stick = nearBottom();
+      document.getElementById('live-activity').innerHTML = window.ActivityLog.renderInline(activity, { open: true });
+      const t = document.getElementById('live-text');
+      t.innerHTML = renderMarkdown(streamed) + (streamed ? '<span class="stream-cursor"></span>' : '');
+      if (stick) container.scrollTop = container.scrollHeight;
+    }
+    const schedulePaint = () => { if (!renderPending) { renderPending = true; requestAnimationFrame(paint); } };
+
+    async function finish(kind, payload) {
+      if (currentRun && currentRun.stopTimer) clearTimeout(currentRun.stopTimer);
+      currentRun = null;
+      setAgentState('IDLE');
+      if (convId) {
+        const conv = await openConversation(convId, { scroll: true });
+        if (conv && kind === 'done') {
+          const last = conv.messages[conv.messages.length - 1];
+          if (last && last.command) window.Proposals.maybeAutoApprove(last.command);
+          const card = last && (last.change || last.command)
+            && document.querySelector(`[data-msg-id="${last.id}"] .change-card`);
+          if (card) card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
+      } else {
+        // request never reached the server: show the error inline
+        live.querySelector('.message-body').innerHTML =
+          `<div class="message-error"><strong>Request failed.</strong> ${escapeHtml(payload && payload.message)}</div>`;
+      }
+      loadConversations();
+      if (kind === 'error') window.showToast('Request failed — details are shown in the chat', 'error');
+      if (kind === 'cancelled') window.showToast('Stopped', 'info');
+      document.getElementById('chat-input').focus();
+    }
+
+    await window.API.streamChat({
+      conversation_id: convId,
+      message: text,
+      provider: state.selectedProvider,
+      model: state.selectedModel,
+      use_repo: state.useRepo,
+      workspace_id: state.activeWorkspace ? state.activeWorkspace.id : null,
+      mode: state.mode,
+      request_id: requestId,
+      retry,
+    }, {
+      onStart: (ev) => {
+        if (!convId) {
+          convId = ev.conversation_id;
+          window.Store.setState({ activeConversationId: convId });
+          document.getElementById('chat-title').textContent = text.slice(0, 80);
+        }
+      },
+      onPlan: (ev) => {
+        const chip = document.getElementById('live-mode');
+        if (chip) chip.textContent = `${ev.mode} · ${ev.scope.replace('_', ' ')}`;
+      },
+      onActivity: (items) => {
+        activity = items;
+        window.Store.setActivityLog(items);
+        schedulePaint();
+      },
+      onChunk: (chunk) => { streamed += chunk; schedulePaint(); },
+      onProgress: (ev) => {
+        const el = document.getElementById('live-progress');
+        if (el) el.textContent = `Receiving edit plan… ${ev.chars.toLocaleString()} characters`;
+      },
+      onDone: () => finish('done'),
+      onCancelled: () => finish('cancelled'),
+      onError: (err) => finish('error', err),
+    }, controller.signal);
+  }
+  window.sendMessage = sendMessage;
+
+  // ── Header controls ─────────────────────────────────────────────────────
+  window.toggleSidebar = function () { document.getElementById('sidebar').classList.toggle('open'); };
+  window.toggleContextPanel = function () { document.getElementById('context-panel').classList.toggle('collapsed'); };
 
   window.switchContextTab = function (tabName) {
-    const tabs = document.querySelectorAll('.context-tab');
-    const contents = document.querySelectorAll('.context-tab-content');
-
-    tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
-    contents.forEach(c => c.classList.toggle('active', c.id === `tab-${tabName}`));
+    document.querySelectorAll('.context-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+    document.querySelectorAll('.context-tab-content').forEach(c => c.classList.toggle('active', c.id === `tab-${tabName}`));
   };
 
-  window.setMode = function (mode) {
+  function setMode(mode, silent = false) {
     window.Store.setMode(mode);
-    const qBtn = document.getElementById('mode-quick');
-    const dBtn = document.getElementById('mode-deep');
-    if (qBtn && dBtn) {
-      qBtn.classList.toggle('active', mode === 'quick');
-      dBtn.classList.toggle('active', mode === 'deep');
-    }
-    window.showToast(`Switched to ${mode === 'quick' ? 'Quick Answer' : 'Deep Investigation'} mode`, 'info');
-  };
+    document.getElementById('mode-quick').classList.toggle('active', mode === 'quick');
+    document.getElementById('mode-deep').classList.toggle('active', mode === 'deep');
+    if (!silent) window.showToast(mode === 'quick' ? 'Quick: focused context' : 'Deep: wider repository context', 'info');
+  }
+  window.setMode = (m) => setMode(m);
 
   window.toggleRepoContext = function () {
-    const current = window.Store.getState().useRepo;
-    window.Store.setUseRepo(!current);
+    window.Store.setUseRepo(!window.Store.getState().useRepo);
     updateRepoStatusIndicator();
   };
 
@@ -735,180 +801,93 @@
     const state = window.Store.getState();
     const btn = document.getElementById('repo-context-btn');
     const status = document.getElementById('repo-context-status');
-
-    if (btn) {
-      btn.classList.toggle('active', state.useRepo);
-      btn.style.color = state.useRepo ? 'var(--accent)' : 'var(--text-2)';
-    }
-
-    if (status) {
-      if (state.useRepo && state.activeWorkspace) {
-        status.textContent = `Using repository: ${state.activeWorkspace.name}`;
-        status.classList.add('active');
-      } else if (state.useRepo && !state.activeWorkspace) {
-        status.textContent = 'Repository context enabled (no workspace selected)';
-        status.classList.remove('active');
-      } else {
-        status.textContent = 'Repository context disabled';
-        status.classList.remove('active');
-      }
+    btn.classList.toggle('active', state.useRepo);
+    if (state.useRepo && state.activeWorkspace) {
+      status.textContent = `Workspace: ${state.activeWorkspace.name}`;
+      status.classList.add('active');
+    } else if (state.useRepo) {
+      status.textContent = 'No workspace selected — add one to ask about code or make changes';
+      status.classList.remove('active');
+    } else {
+      status.textContent = 'Workspace context off — general questions only';
+      status.classList.remove('active');
     }
   }
 
-  // Permission Modal
-  window.requestPermission = function ({ command, reason }) {
-    return new Promise((resolve, reject) => {
-      const modal = document.getElementById('permission-modal');
-      const cmdEl = document.getElementById('permission-command');
-      const rsnEl = document.getElementById('permission-reason');
-
-      if (!modal) {
-        resolve(true);
-        return;
-      }
-
-      if (window.Store.hasSessionPermission(command)) {
-        resolve(true);
-        return;
-      }
-
-      cmdEl.textContent = command;
-      rsnEl.textContent = reason || 'Execution of local system command required.';
-      modal.classList.remove('hidden');
-
-      pendingPermissionCallback = { resolve, reject, command };
-    });
-  };
-
-  window.allowPermission = function () {
-    closeModal('permission-modal');
-    if (pendingPermissionCallback) {
-      pendingPermissionCallback.resolve(true);
-      pendingPermissionCallback = null;
-    }
-  };
-
-  window.allowPermissionSession = function () {
-    closeModal('permission-modal');
-    if (pendingPermissionCallback) {
-      window.Store.allowSessionPermission(pendingPermissionCallback.command);
-      pendingPermissionCallback.resolve(true);
-      pendingPermissionCallback = null;
-    }
-  };
-
-  window.rejectPermission = function () {
-    closeModal('permission-modal');
-    if (pendingPermissionCallback) {
-      pendingPermissionCallback.reject(new Error('Permission rejected by user'));
-      pendingPermissionCallback = null;
-    }
-  };
-
-  // Settings Modal
-  window.showSettings = async function () {
+  // ── Settings ────────────────────────────────────────────────────────────
+  window.showSettings = function () {
     document.getElementById('settings-modal').classList.remove('hidden');
     switchSettingsSection('account');
   };
 
   window.switchSettingsSection = async function (section) {
-    const navBtns = document.querySelectorAll('.settings-nav-btn');
-    navBtns.forEach(b => b.classList.toggle('active', b.dataset.section === section));
-
+    document.querySelectorAll('.settings-nav-btn').forEach(b => b.classList.toggle('active', b.dataset.section === section));
     const content = document.getElementById('settings-content');
-    if (!content) return;
-
     const user = window.Store.getState().user || {};
     const models = window.Store.getState().models || {};
 
     if (section === 'account') {
       content.innerHTML = `
         <div class="settings-section">
-          <h4>Account Profile</h4>
-          <div class="form-group" style="margin-bottom:12px;">
-            <label style="display:block; font-size:12px; margin-bottom:4px;">Email</label>
-            <input type="text" value="${escapeHtml(user.email || '')}" disabled style="width:100%; padding:8px; background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius-sm); color:var(--text-1);" />
-          </div>
-          <div class="form-group" style="margin-bottom:12px;">
-            <label style="display:block; font-size:12px; margin-bottom:4px;">Display Name</label>
-            <input type="text" id="settings-name" value="${escapeHtml(user.name || '')}" style="width:100%; padding:8px; background:var(--bg-2); border:1px solid var(--border); border-radius:var(--radius-sm); color:var(--text-0);" />
-          </div>
-          <button class="btn btn-primary" onclick="saveAccountSettings()">Save Profile</button>
-          <div style="margin-top:24px; padding-top:16px; border-top:1px solid var(--border);">
-            <button class="btn btn-danger" onclick="logout()">Sign Out</button>
-          </div>
-        </div>
-      `;
+          <h4>Account</h4>
+          <div class="form-group"><label>Email</label><input type="text" value="${escapeHtml(user.email || '')}" disabled /></div>
+          <div class="form-group"><label>Display name</label><input type="text" id="settings-name" value="${escapeHtml(user.name || '')}" /></div>
+          <button class="btn btn-primary" onclick="saveAccountSettings()">Save</button>
+          <div class="settings-divider"></div>
+          <button class="btn btn-danger" onclick="logout()">Sign out</button>
+        </div>`;
     } else if (section === 'ai') {
-      let providersHtml = '';
-      for (const [pKey, pInfo] of Object.entries(models)) {
-        const isReady = pInfo.available;
-        providersHtml += `
-          <div style="display:flex; align-items:center; justify-content:space-between; padding:10px; background:var(--bg-2); border-radius:var(--radius-sm); margin-bottom:8px; border:1px solid var(--border);">
-            <div>
-              <div style="font-weight:600; font-size:13px;">${pInfo.name || pKey}</div>
-              <div style="font-size:11px; color:var(--text-2);">${(pInfo.models || []).join(', ')}</div>
-            </div>
-            <span class="provider-status ${isReady ? 'available' : 'unavailable'}">${isReady ? 'Ready' : 'Not Configured'}</span>
-          </div>
-        `;
-      }
       content.innerHTML = `
         <div class="settings-section">
-          <h4>LLM Providers & Models</h4>
-          <p style="font-size:12px; color:var(--text-2); margin-bottom:12px;">Set your API keys in your environment variables (.env) or docker configuration.</p>
-          ${providersHtml}
-        </div>
-      `;
+          <h4>LLM providers</h4>
+          <p class="settings-hint">API keys are configured on the server (environment variables) and never sent to the browser. Ollama is optional.</p>
+          ${Object.entries(models).map(([k, p]) => `
+            <div class="provider-row">
+              <div><div class="provider-row-name">${escapeHtml(p.label || k)}</div>
+                <div class="provider-row-sub">${p.error ? escapeHtml(p.error) : `${(p.models || []).length} models · default ${escapeHtml(p.default_model || '')}`}</div></div>
+              <span class="provider-status ${p.status === 'ready' ? 'available' : p.status === 'error' ? 'warning' : 'unavailable'}">${escapeHtml(p.status)}</span>
+            </div>`).join('')}
+          <button class="btn btn-secondary" onclick="reloadModels().then(() => switchSettingsSection('ai'))">Refresh</button>
+        </div>`;
     } else if (section === 'usage') {
-      content.innerHTML = '<div class="sidebar-loading">Loading usage stats...</div>';
+      content.innerHTML = '<div class="sidebar-loading">Loading usage…</div>';
       try {
-        const stats = await window.API.getUsage('all');
+        const [today, all] = await Promise.all([window.API.getUsage('today'), window.API.getUsage('all')]);
+        const tile = (label, value, cls = '') => `<div class="usage-stat"><div class="usage-stat-label">${label}</div><div class="usage-stat-value ${cls}">${value}</div></div>`;
         content.innerHTML = `
           <div class="settings-section">
-            <h4>API Usage & Tokens</h4>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px;">
-              <div class="usage-stat">
-                <div class="usage-stat-label">TOTAL REQUESTS</div>
-                <div class="usage-stat-value">${stats.requests || 0}</div>
-              </div>
-              <div class="usage-stat">
-                <div class="usage-stat-label">TOTAL TOKENS</div>
-                <div class="usage-stat-value">${(stats.total_tokens || 0).toLocaleString()}</div>
-              </div>
+            <h4>Usage</h4>
+            <div class="usage-grid">
+              ${tile('REQUESTS TODAY', today.requests || 0)}
+              ${tile('TOKENS TODAY', (today.total_tokens || 0).toLocaleString())}
+              ${tile('ALL-TIME TOKENS', (all.total_tokens || 0).toLocaleString())}
+              ${tile('EST. COST (ALL)', '$' + (all.cost_usd || 0).toFixed(4))}
             </div>
-            <div class="usage-stat">
-              <div class="usage-stat-label">ESTIMATED COST</div>
-              <div class="usage-stat-value" style="color:var(--green);">$${(stats.cost_usd || 0).toFixed(4)}</div>
-            </div>
-          </div>
-        `;
+            <table class="usage-table"><thead><tr><th>Provider</th><th>Requests</th><th>Tokens</th><th>Est. cost</th></tr></thead><tbody>
+            ${Object.entries(all.by_provider || {}).map(([p, v]) => `<tr><td>${escapeHtml(p)}</td><td>${v.requests}</td>
+              <td>${(v.input_tokens + v.output_tokens).toLocaleString()}</td><td>$${v.cost_usd.toFixed(4)}</td></tr>`).join('') || '<tr><td colspan="4">No usage yet</td></tr>'}
+            </tbody></table>
+            <p class="settings-hint">Costs are estimates from a static price table.</p>
+          </div>`;
       } catch (e) {
-        content.innerHTML = '<div style="color:var(--red);">Could not load usage data</div>';
+        content.innerHTML = '<div class="change-error">Could not load usage data</div>';
       }
     } else if (section === 'permissions') {
       const allowed = Array.from(window.Store.getState().sessionPermissions || []);
       content.innerHTML = `
         <div class="settings-section">
-          <h4>Execution Permissions</h4>
-          <p style="font-size:12px; color:var(--text-2); margin-bottom:12px;">Commands approved for execution during this session:</p>
-          ${allowed.length ? allowed.map(cmd => `<div style="font-family:var(--font-mono); font-size:12px; padding:6px 8px; background:var(--bg-2); border-radius:4px; margin-bottom:4px;">${escapeHtml(cmd)}</div>`).join('') : '<div style="font-size:12px; color:var(--text-3);">No session permissions granted yet.</div>'}
-        </div>
-      `;
+          <h4>Command permissions</h4>
+          <p class="settings-hint">Commands always need approval. "Allow for session" remembers an exact command until you reload the page. Destructive commands are blocked by the server regardless.</p>
+          ${allowed.length ? allowed.map(cmd => `<div class="perm-item"><code>${escapeHtml(cmd)}</code></div>`).join('') : '<div class="settings-hint">No commands allowed for this session.</div>'}
+        </div>`;
     } else if (section === 'appearance') {
-      content.innerHTML = `
-        <div class="settings-section">
-          <h4>Appearance & Theme</h4>
-          <p style="font-size:12px; color:var(--text-2);">CodeSage uses an optimized developer dark theme by default.</p>
-        </div>
-      `;
+      content.innerHTML = '<div class="settings-section"><h4>Appearance</h4><p class="settings-hint">CodeSage uses a dark developer theme.</p></div>';
     }
   };
 
   window.saveAccountSettings = async function () {
-    const name = document.getElementById('settings-name').value.trim();
     try {
-      const res = await window.API.updateMe({ name });
+      const res = await window.API.updateMe({ name: document.getElementById('settings-name').value.trim() });
       window.Store.setUser(res.user);
       renderUserProfile(res.user);
       window.showToast('Profile updated', 'success');
@@ -922,32 +901,31 @@
     window.location.reload();
   };
 
+  // ── Keyboard shortcuts ──────────────────────────────────────────────────
   function setupGlobalKeybindings() {
     document.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+      const mod = e.ctrlKey || e.metaKey;
+      if (e.key === 'Escape' && agentState === 'RUNNING') {
         e.preventDefault();
-        newChat();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        stopCurrentRequest();
+      } else if (e.key === 'Escape') {
+        ['diff-modal', 'workspace-modal', 'settings-modal'].forEach(closeModal);
+      } else if (mod && e.key.toLowerCase() === 'n') {
         e.preventDefault();
-        toggleSidebar();
+        window.newChat();
+      } else if (mod && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        window.toggleSidebar();
+      } else if (mod && e.key === ',') {
+        e.preventDefault();
+        window.showSettings();
+      } else if (e.key === '/' && document.activeElement.tagName !== 'TEXTAREA' && document.activeElement.tagName !== 'INPUT') {
+        e.preventDefault();
+        document.getElementById('chat-input').focus();
       }
     });
   }
 
-  function escapeHtml(str) {
-    if (!str) return '';
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
-
-  // Initialize on DOM ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', bootstrapApp);
-  } else {
-    bootstrapApp();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrapApp);
+  else bootstrapApp();
 })();

@@ -1,8 +1,10 @@
 """
 OpenRouter provider — OpenAI-compatible API that proxies many models.
 """
+from typing import Optional
+
 from app.llm.openai_provider import OpenAIProvider
-from app.llm.base import ModelInfo, ProviderNotAvailableError
+from app.llm.base import ModelInfo, Timeouts
 
 OPENROUTER_MODELS = {
     "google/gemini-3.6-flash": {"context": 1_000_000, "max_out": 8_192},
@@ -20,11 +22,14 @@ OPENROUTER_MODELS = {
 
 class OpenRouterProvider(OpenAIProvider):
     """OpenRouter — proxies many models via OpenAI-compatible API."""
+    max_tokens_param = "max_tokens"
 
     def __init__(self, api_key: str, model: str = "google/gemini-3.6-flash",
-                 base_url: str = "https://openrouter.ai/api/v1"):
+                 base_url: str = "https://openrouter.ai/api/v1",
+                 timeouts: Optional[Timeouts] = None):
         super().__init__(api_key=api_key, model=model, base_url=base_url,
-                         provider_name_override="openrouter", label_override="OpenRouter")
+                         provider_name_override="openrouter", label_override="OpenRouter",
+                         timeouts=timeouts)
 
     def _build_headers(self) -> dict:
         headers = super()._build_headers()

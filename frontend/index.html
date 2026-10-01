@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CodeSage — AI Engineering Workspace</title>
+  <title>CodeSage</title>
   <meta name="description" content="CodeSage is an AI-powered software engineering workspace that understands your repository, investigates problems, proposes code changes, and lets you stay in control." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -11,6 +11,7 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -131,18 +132,6 @@
 
       <!-- Messages -->
       <div class="messages-container" id="messages-container">
-        <!-- Empty state -->
-        <div class="empty-state" id="empty-state">
-          <div class="empty-icon">⚡</div>
-          <h2>Start building with AI</h2>
-          <p>Ask anything about your codebase, debug issues, or request code changes.</p>
-          <div class="suggestions-grid">
-            <button class="suggestion-btn" onclick="sendSuggestion('Explain this project\'s architecture')">Explain this project</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('Find potential security vulnerabilities')">Find security issues</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('How does authentication work in this codebase?')">Explain auth flow</button>
-            <button class="suggestion-btn" onclick="sendSuggestion('Add unit tests for the main service')">Add unit tests</button>
-          </div>
-        </div>
       </div>
 
       <!-- Chat Input -->
@@ -151,14 +140,14 @@
           <textarea
             id="chat-input"
             class="chat-textarea"
-            placeholder="Ask anything about your code... (Ctrl+Enter to send)"
+            placeholder="Ask about your code or request a change… (Enter to send, Shift+Enter for newline)"
             rows="1"
             onkeydown="handleInputKeydown(event)"
             oninput="autoResizeTextarea(this)"
           ></textarea>
           <div class="chat-input-actions">
             <div class="input-status" id="input-status"></div>
-            <button class="send-btn" id="send-btn" onclick="sendMessage()" title="Send (Ctrl+Enter)">
+            <button class="send-btn" id="send-btn" title="Send (Enter)">
               <span class="send-icon">↑</span>
             </button>
           </div>
@@ -231,34 +220,20 @@
           <input type="text" id="ws-name" placeholder="My Project" />
         </div>
         <div class="form-group">
-          <label for="ws-path">Repository Path</label>
-          <input type="text" id="ws-path" placeholder="/path/to/your/project" />
-          <small>Absolute path to a local directory</small>
+          <label for="ws-path">Repository path</label>
+          <input type="text" id="ws-path" placeholder="/path/to/your/project" onkeydown="if(event.key==='Enter')createWorkspace()" />
+          <small id="ws-path-hint">Absolute path to a directory on the machine running CodeSage</small>
+        </div>
+        <div class="form-group" id="ws-git-group">
+          <label for="ws-git">…or clone a Git repository</label>
+          <input type="text" id="ws-git" placeholder="https://github.com/owner/repo.git" />
+          <small>Public HTTPS URL; cloned into your private workspace folder on the server</small>
         </div>
         <div id="ws-error" class="auth-error hidden"></div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('workspace-modal')">Cancel</button>
         <button class="btn btn-primary" id="ws-submit-btn" onclick="createWorkspace()">Add Workspace</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Permission Dialog -->
-  <div class="modal-overlay hidden" id="permission-modal">
-    <div class="modal modal-permission">
-      <div class="modal-header">
-        <div class="permission-icon" id="permission-icon">🔐</div>
-        <h3 id="permission-title">AI wants to execute a command</h3>
-      </div>
-      <div class="modal-body">
-        <div class="permission-command" id="permission-command"></div>
-        <div class="permission-reason" id="permission-reason"></div>
-      </div>
-      <div class="modal-footer permission-actions">
-        <button class="btn btn-danger" onclick="rejectPermission()">Reject</button>
-        <button class="btn btn-secondary" onclick="allowPermissionSession()">Allow for Session</button>
-        <button class="btn btn-primary" onclick="allowPermission()">Allow Once</button>
       </div>
     </div>
   </div>
@@ -277,8 +252,8 @@
         <div id="diff-viewer" class="diff-viewer"></div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-danger" onclick="rejectDiff()">Reject Changes</button>
-        <button class="btn btn-primary" onclick="acceptDiff()">Accept Changes</button>
+        <span class="change-note">Accept or reject from the change card in the chat.</span>
+        <button class="btn btn-secondary" onclick="closeDiffModal()">Close</button>
       </div>
     </div>
   </div>
@@ -316,6 +291,7 @@
   <script src="src/api.js"></script>
   <script src="src/store.js"></script>
   <script src="src/components/DiffViewer.js"></script>
+  <script src="src/components/Proposals.js"></script>
   <script src="src/components/ModelSelector.js"></script>
   <script src="src/components/ActivityLog.js"></script>
   <script src="src/components/CommandPalette.js"></script>

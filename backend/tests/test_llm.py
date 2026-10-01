@@ -34,8 +34,19 @@ def test_provider_factory_unknown(app):
 
 def test_provider_factory_get_openai(app):
     with app.app_context():
-        provider = ProviderFactory.get("openai", model="gpt-4o")
+        provider = ProviderFactory.get("openai", model="gpt-5.6-terra")
         assert provider is not None
         model_info = provider.get_model_info()
         assert model_info.provider == "openai"
-        assert model_info.model == "gpt-4o"
+        assert model_info.model == "gpt-5.6-terra"
+
+
+def test_provider_factory_get_gemini(app):
+    with app.app_context():
+        # Inject mock gemini key into test app config
+        app.config["GEMINI_API_KEY"] = "mock-gemini-key-0123456789"
+        provider = ProviderFactory.get("gemini", model="gemini-3.6-flash")
+        assert provider is not None
+        model_info = provider.get_model_info()
+        assert model_info.provider == "gemini"
+        assert model_info.model == "gemini-3.6-flash"

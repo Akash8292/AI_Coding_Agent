@@ -18,7 +18,7 @@ def health():
         db_ok = False
 
     # Check at least one provider is available
-    providers_info = ProviderFactory.get_all_info(cfg)
+    providers_info = ProviderFactory.get_all_info(cfg, live_models=False)
     available_providers = [k for k, v in providers_info.items() if v.get("available")]
 
     return jsonify({
@@ -27,7 +27,8 @@ def health():
         "database": "connected" if db_ok else "error",
         "providers_available": available_providers,
         "default_provider": cfg.get("DEFAULT_PROVIDER", "openai"),
-    })
+        "ollama": providers_info.get("ollama", {}).get("status"),
+    }), (200 if db_ok else 503)
 
 
 @health_bp.route("/api/models")
