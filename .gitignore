@@ -16,3 +16,4 @@ workspaces/
 venv/
 .venv/
 backend/test_out.txt
+.kilo
